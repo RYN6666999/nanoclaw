@@ -4,7 +4,7 @@ import path from 'path';
 
 import { proto } from '@whiskeysockets/baileys';
 
-import { STORE_DIR } from './config.js';
+import { ASSISTANT_NAME, STORE_DIR } from './config.js';
 import { NewMessage, ScheduledTask, TaskRunLog } from './types.js';
 
 let db: Database.Database;
@@ -393,4 +393,24 @@ export function getTaskRunLogs(taskId: string, limit = 10): TaskRunLog[] {
   `,
     )
     .all(taskId, limit) as TaskRunLog[];
+}
+
+/**
+ * Store a Telegram message directly (no WhatsApp proto dependency).
+ */
+export function storeTelegramMessage(
+  msgId: string,
+  chatJid: string,
+  sender: string,
+  senderName: string,
+  content: string,
+  timestamp: string,
+  isFromMe: boolean,
+): void {
+  // Ensure chat entry exists
+  storeChatMetadata(chatJid, timestamp);
+
+  db.prepare(
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(msgId, chatJid, sender, senderName, content, timestamp, isFromMe ? 1 : 0);
 }
