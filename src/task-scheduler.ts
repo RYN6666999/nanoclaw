@@ -9,7 +9,8 @@ import {
   SCHEDULER_POLL_INTERVAL,
   TIMEZONE,
 } from './config.js';
-import { runContainerAgent, writeTasksSnapshot } from './container-runner.js';
+import { writeTasksSnapshot } from './container-runner.js';
+import { runHostAgent } from './host-agent.js';
 import {
   getAllTasks,
   getDueTasks,
@@ -86,7 +87,7 @@ async function runTask(
     task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
 
   try {
-    const output = await runContainerAgent(group, {
+    const output = await runHostAgent(group, {
       prompt: task.prompt,
       sessionId,
       groupFolder: task.group_folder,
