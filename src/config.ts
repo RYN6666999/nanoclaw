@@ -67,6 +67,7 @@ export interface RouterConfig {
     openrouter: { enabled: boolean; url: string; model: string };
     gemini: { enabled: boolean; model: string; auto_threshold: number };
     claude: { enabled: boolean; model: string };
+    [key: string]: { enabled: boolean; [k: string]: unknown };
   };
   complex_keywords: string[];
   search_keywords: string[];
@@ -130,6 +131,11 @@ export const OPENROUTER_MODEL =
   ROUTER_CONFIG?.backends?.openrouter?.model ||
   process.env.OPENROUTER_MODEL ||
   'deepseek/deepseek-chat';
+
+// DeepSeek Direct API (官方，繞過 OpenRouter 加價)
+export const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || '';
+export const DEEPSEEK_API_BASE_URL = 'https://api.deepseek.com/v1';
+export const DEEPSEEK_MODEL = 'deepseek-chat';
 
 // LM Studio (Ollama fallback for local)
 export const LM_STUDIO_BASE_URL =
