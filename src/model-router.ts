@@ -5,6 +5,8 @@
  */
 import {
   DEFAULT_LOCAL_MODEL,
+  DEEPSEEK_API_KEY,
+  DEEPSEEK_MODEL,
   GEMINI_API_KEY,
   GEMINI_AUTO_THRESHOLD,
   GEMINI_MODEL,
@@ -13,19 +15,25 @@ import {
   ROUTER_CONFIG,
 } from './config.js';
 
-export type Backend = 'local' | 'gemini' | 'openrouter' | 'claude';
+export type Backend = 'local' | 'gemini' | 'openrouter' | 'deepseek-direct' | 'claude';
+
+export type RouteReason = 'prefix' | 'search' | 'complex' | 'long-doc' | 'default' | 'scheduled';
 
 export interface RouteResult {
   backend: Backend;
   model: string;
   prompt: string;
+  reason: RouteReason;
+  /** The original prefix command if reason=prefix, e.g. "/deepseek" */
+  prefix?: string;
 }
 
 const PREFIX_MAP: Record<string, { backend: Backend; model: string }> = {
   '/claude': { backend: 'claude', model: 'claude' },
-  '/deepseek': { backend: 'openrouter', model: OPENROUTER_MODEL },
+  '/deepseek': { backend: 'deepseek-direct', model: DEEPSEEK_MODEL },
   '/openrouter': { backend: 'openrouter', model: OPENROUTER_MODEL },
   '/gemini': { backend: 'gemini', model: GEMINI_MODEL },
+  '/x': { backend: 'openrouter', model: 'x-ai/grok-4.1-fast' },
 };
 
 const COMPLEX_KEYWORDS = ROUTER_CONFIG?.complex_keywords || [
@@ -65,7 +73,7 @@ export function routeMessage(
 ): RouteResult {
   // Scheduled tasks always use Claude CLI (they need tools)
   if (isScheduledTask) {
-    return { backend: 'claude', model: 'claude', prompt: rawPrompt };
+    return { backend: 'claude', model: 'claude', prompt: rawPrompt, reason: 'scheduled' };
   }
 
   // Check prefix commands (highest priority)
@@ -80,16 +88,17 @@ export function routeMessage(
       const prompt = stripped
         ? rawPrompt.replace(lastMessageText, stripped)
         : rawPrompt;
-      return { backend: route.backend, model: route.model, prompt };
+      return { backend: route.backend, model: route.model, prompt, reason: 'prefix', prefix };
     }
   }
 
-  // Auto-detect search needs → use OpenRouter with tools
-  if (OPENROUTER_API_KEY && isBackendEnabled('openrouter') && needsSearch(lastMessageText)) {
+  // Auto-detect search needs → use DeepSeek direct
+  if (DEEPSEEK_API_KEY && needsSearch(lastMessageText)) {
     return {
-      backend: 'openrouter',
-      model: OPENROUTER_MODEL,
+      backend: 'deepseek-direct',
+      model: DEEPSEEK_MODEL,
       prompt: rawPrompt,
+      reason: 'search',
     };
   }
 
@@ -99,24 +108,56 @@ export function routeMessage(
       backend: 'gemini',
       model: GEMINI_MODEL,
       prompt: rawPrompt,
+      reason: 'long-doc',
     };
   }
 
-  // Auto-detect complex tasks → use OpenRouter
-  if (OPENROUTER_API_KEY && isBackendEnabled('openrouter') && isComplexTask(lastMessageText)) {
+  // Auto-detect complex tasks → use DeepSeek direct
+  if (DEEPSEEK_API_KEY && isComplexTask(lastMessageText)) {
     return {
-      backend: 'openrouter',
-      model: OPENROUTER_MODEL,
+      backend: 'deepseek-direct',
+      model: DEEPSEEK_MODEL,
       prompt: rawPrompt,
+      reason: 'complex',
     };
   }
 
-  // Default: local LLM (free, zero cost)
+  // Default: DeepSeek direct (cheapest capable model)
+  if (DEEPSEEK_API_KEY) {
+    return {
+      backend: 'deepseek-direct',
+      model: DEEPSEEK_MODEL,
+      prompt: rawPrompt,
+      reason: 'default',
+    };
+  }
+
+  // Fallback: local LLM (free, zero cost)
   return {
     backend: 'local',
     model: DEFAULT_LOCAL_MODEL,
     prompt: rawPrompt,
+    reason: 'default',
   };
+}
+
+const REASON_LABELS: Record<RouteReason, string> = {
+  prefix: '',       // will use prefix field instead
+  search: '搜尋',
+  complex: '複雜',
+  'long-doc': '長文',
+  default: '預設',
+  scheduled: '排程',
+};
+
+/**
+ * Format route signature for display, e.g. "[/deepseek → deepseek-chat]"
+ */
+export function formatRouteSignature(route: RouteResult): string {
+  const label = route.reason === 'prefix' && route.prefix
+    ? route.prefix
+    : REASON_LABELS[route.reason];
+  return `[${label} → ${route.model}]`;
 }
 
 /**

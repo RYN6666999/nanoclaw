@@ -9,6 +9,8 @@ import path from 'path';
 import {
   AGENT_TIMEOUT,
   CLAUDE_CLI_PATH,
+  DEEPSEEK_API_BASE_URL,
+  DEEPSEEK_API_KEY,
   GEMINI_API_KEY,
   GEMINI_MODEL,
   GROUPS_DIR,
@@ -18,7 +20,7 @@ import {
   OPENROUTER_API_KEY,
 } from './config.js';
 import { logger } from './logger.js';
-import { routeMessage } from './model-router.js';
+import { routeMessage, formatRouteSignature } from './model-router.js';
 import {
   initializeObsidianMemory,
   readObsidianContext,
@@ -49,7 +51,15 @@ const conversationHistory: Record<
 > = {};
 const MAX_HISTORY = 20;
 
-function getSystemPrompt(groupFolder: string): string {
+const AGENT_SOUL_COMPACT = `
+## Agent Soul（精實原則）
+- 如無必要，勿增實體。複製成功優於造神。
+- 任務分級：L1(快軌:直接做) L2(標準:做完驗證) L3(容災:多檔/架構/高風險)
+- 3-Strike：失敗1→自修 失敗2→換方案 失敗3→重新設計
+- 回答前判斷：此問題是否超出我的能力邊界？超出則建議用戶切換前綴。
+`;
+
+function getSystemPrompt(groupFolder: string, backend?: string): string {
   let prompt = 'You are a helpful assistant.';
 
   // Load group-specific memory
@@ -58,6 +68,11 @@ function getSystemPrompt(groupFolder: string): string {
     prompt = fs.readFileSync(claudeMdPath, 'utf-8');
   } catch {
     // Use default
+  }
+
+  // Append agent-soul principles for capable models (not local)
+  if (backend && backend !== 'local') {
+    prompt += '\n' + AGENT_SOUL_COMPACT;
   }
 
   // Append Obsidian context for memory continuity
@@ -88,7 +103,7 @@ async function runLocal(
   prompt: string,
   groupFolder: string,
 ): Promise<HostAgentOutput> {
-  const systemPrompt = getSystemPrompt(groupFolder);
+  const systemPrompt = getSystemPrompt(groupFolder, 'local');
   const userText = extractMessagesForLocal(prompt);
 
   // Manage conversation history
@@ -160,7 +175,7 @@ async function runOpenRouter(
   prompt: string,
   groupFolder: string,
 ): Promise<HostAgentOutput> {
-  const systemPrompt = getSystemPrompt(groupFolder);
+  const systemPrompt = getSystemPrompt(groupFolder, 'openrouter');
   const userText = extractMessagesForLocal(prompt);
 
   // Manage conversation history (separate from local)
@@ -290,12 +305,87 @@ async function runOpenRouter(
   }
 }
 
+async function runDeepSeekDirect(
+  model: string,
+  prompt: string,
+  groupFolder: string,
+): Promise<HostAgentOutput> {
+  const systemPrompt = getSystemPrompt(groupFolder, 'deepseek-direct');
+  const userText = extractMessagesForLocal(prompt);
+
+  const historyKey = `deepseek_${groupFolder}`;
+  if (!conversationHistory[historyKey]) {
+    conversationHistory[historyKey] = [];
+  }
+  const history = conversationHistory[historyKey];
+  history.push({ role: 'user', content: userText });
+
+  while (history.length > MAX_HISTORY) {
+    history.shift();
+  }
+
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...history,
+  ];
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), AGENT_TIMEOUT);
+
+    const response = await fetch(`${DEEPSEEK_API_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        stream: false,
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`DeepSeek API error ${response.status}: ${errorText}`);
+    }
+
+    const data = (await response.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+
+    const result = data.choices?.[0]?.message?.content?.trim() || '';
+    history.push({ role: 'assistant', content: result });
+
+    logger.info(
+      { model, group: groupFolder, responseLength: result.length },
+      'DeepSeek direct response received',
+    );
+
+    if (userText.length > 100 || result.length > 100) {
+      writeObsidianContext(
+        `## Last DeepSeek Exchange\n\nUser: ${userText.slice(0, 200)}\n\nAssistant: ${result.slice(0, 200)}`,
+      );
+    }
+
+    return { status: 'success', result };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.error({ model, group: groupFolder, error: message }, 'DeepSeek direct error');
+    return { status: 'error', result: null, error: message };
+  }
+}
+
 async function runGemini(
   model: string,
   prompt: string,
   groupFolder: string,
 ): Promise<HostAgentOutput> {
-  const systemPrompt = getSystemPrompt(groupFolder);
+  const systemPrompt = getSystemPrompt(groupFolder, 'gemini');
   const userText = extractMessagesForLocal(prompt);
 
   // Manage conversation history (separate from other backends)
@@ -388,7 +478,7 @@ async function runClaudeCli(
   isMain: boolean,
 ): Promise<HostAgentOutput> {
   const groupDir = path.join(GROUPS_DIR, groupFolder);
-  const systemPrompt = getSystemPrompt(groupFolder);
+  const systemPrompt = getSystemPrompt(groupFolder, 'claude');
 
   const args: string[] = [
     '-p', prompt,
@@ -532,6 +622,8 @@ export async function runHostAgent(
 
   if (route.backend === 'local') {
     output = await runLocal(route.model, route.prompt, input.groupFolder);
+  } else if (route.backend === 'deepseek-direct') {
+    output = await runDeepSeekDirect(route.model, route.prompt, input.groupFolder);
   } else if (route.backend === 'gemini') {
     output = await runGemini(route.model, route.prompt, input.groupFolder);
   } else if (route.backend === 'openrouter') {
@@ -545,12 +637,18 @@ export async function runHostAgent(
     );
   }
 
+  // Append route signature to result
+  if (output.result) {
+    output.result = `${output.result}\n${formatRouteSignature(route)}`;
+  }
+
   const duration = Date.now() - startTime;
   logger.info(
     {
       group: group.name,
       backend: route.backend,
       model: route.model,
+      reason: route.reason,
       duration,
       status: output.status,
     },

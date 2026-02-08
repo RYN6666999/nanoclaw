@@ -1,4 +1,6 @@
 // .env loading moved to config.ts (ESM imports hoist before module body)
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   ASSISTANT_NAME,
   DATA_DIR,

@@ -1,8 +1,8 @@
 /**
  * Telegram Channel for NanoClaw
- * Connects to Telegram via Bot API and routes messages to the agent.
+ * Uses grammY for robust polling with built-in retry/backoff.
  */
-import TelegramBot from 'node-telegram-bot-api';
+import { Bot, GrammyError, HttpError } from 'grammy';
 
 import { ASSISTANT_NAME, MAIN_GROUP_FOLDER } from './config.js';
 import {
@@ -40,9 +40,9 @@ interface TelegramConfig {
   registerGroup: (jid: string, group: RegisteredGroup) => void;
 }
 
-let bot: TelegramBot | null = null;
+let bot: Bot | null = null;
 
-export function getTelegramBot(): TelegramBot | null {
+export function getTelegramBot(): Bot | null {
   return bot;
 }
 
@@ -50,25 +50,38 @@ export async function connectTelegram(
   token: string,
   config: TelegramConfig,
 ): Promise<void> {
-  bot = new TelegramBot(token, { polling: true });
+  bot = new Bot(token);
 
-  const botInfo = await bot.getMe();
-  logger.info(
-    { botUsername: botInfo.username, botId: botInfo.id },
-    'Connected to Telegram',
-  );
+  // Global error boundary — catches all unhandled errors
+  bot.catch((err) => {
+    const ctx = err.ctx;
+    const e = err.error;
 
-  bot.on('message', async (msg) => {
-    if (!msg.text) return;
-    if (msg.from?.id === botInfo.id) return;
+    if (e instanceof GrammyError) {
+      logger.error(
+        { code: e.error_code, description: e.description, method: e.method },
+        'Telegram API error',
+      );
+    } else if (e instanceof HttpError) {
+      logger.error({ err: e.message }, 'Telegram HTTP/network error');
+    } else {
+      logger.error({ err: e, updateId: ctx?.update?.update_id }, 'Telegram handler error');
+    }
+  });
+
+  // Handle text messages
+  bot.on('message:text', async (ctx) => {
+    const msg = ctx.message;
+    const botId = ctx.me.id;
+    if (msg.from.id === botId) return;
 
     const chatJid = makeTelegramJid(msg.chat.id);
     const timestamp = new Date(msg.date * 1000).toISOString();
     const senderName =
-      msg.from?.first_name ||
-      msg.from?.username ||
-      String(msg.from?.id || 'unknown');
-    const sender = String(msg.from?.id || 'unknown');
+      msg.from.first_name ||
+      msg.from.username ||
+      String(msg.from.id);
+    const sender = String(msg.from.id);
 
     // Store the message
     storeTelegramMessage(
@@ -91,8 +104,8 @@ export async function connectTelegram(
       if (!mainExists) {
         const chatName =
           msg.chat.title ||
-          msg.chat.first_name ||
-          msg.chat.username ||
+          ('first_name' in msg.chat ? msg.chat.first_name : undefined) ||
+          ('username' in msg.chat ? msg.chat.username : undefined) ||
           `Telegram ${msg.chat.id}`;
         config.registerGroup(chatJid, {
           name: chatName,
@@ -132,7 +145,7 @@ export async function connectTelegram(
       'Processing Telegram message',
     );
 
-    await bot!.sendChatAction(msg.chat.id, 'typing');
+    await ctx.replyWithChatAction('typing');
 
     const response = await config.runAgent(group, prompt, chatJid);
 
@@ -154,8 +167,17 @@ export async function connectTelegram(
     }
   });
 
-  bot.on('polling_error', (err) => {
-    logger.error({ err: err.message }, 'Telegram polling error');
+  // Validate token
+  const botInfo = await bot.api.getMe();
+  logger.info(
+    { botUsername: botInfo.username, botId: botInfo.id },
+    'Connected to Telegram (grammY)',
+  );
+
+  // Start long polling with built-in retry/backoff
+  bot.start({
+    onStart: () => logger.info('Telegram polling started'),
+    drop_pending_updates: true,
   });
 }
 
@@ -168,9 +190,23 @@ export async function sendTelegramMessage(
     return;
   }
   try {
-    await bot.sendMessage(chatId, text);
+    await bot.api.sendMessage(chatId, text);
     logger.info({ chatId, length: text.length }, 'Telegram message sent');
   } catch (err) {
-    logger.error({ chatId, err }, 'Failed to send Telegram message');
+    if (err instanceof GrammyError) {
+      logger.error(
+        { chatId, code: err.error_code, description: err.description },
+        'Failed to send Telegram message',
+      );
+    } else {
+      logger.error({ chatId, err }, 'Failed to send Telegram message');
+    }
+  }
+}
+
+export async function stopTelegram(): Promise<void> {
+  if (bot) {
+    await bot.stop();
+    logger.info('Telegram bot stopped');
   }
 }
