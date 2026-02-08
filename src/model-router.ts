@@ -34,6 +34,7 @@ const PREFIX_MAP: Record<string, { backend: Backend; model: string }> = {
   '/openrouter': { backend: 'openrouter', model: OPENROUTER_MODEL },
   '/gemini': { backend: 'gemini', model: GEMINI_MODEL },
   '/x': { backend: 'openrouter', model: 'x-ai/grok-4.1-fast' },
+  '/local': { backend: 'local', model: DEFAULT_LOCAL_MODEL },
 };
 
 const COMPLEX_KEYWORDS = ROUTER_CONFIG?.complex_keywords || [
