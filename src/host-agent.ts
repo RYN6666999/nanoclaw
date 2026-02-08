@@ -21,6 +21,7 @@ import {
 } from './config.js';
 import { logger } from './logger.js';
 import { routeMessage, formatRouteSignature } from './model-router.js';
+import { getToolDefinitions, getToolHandler } from './tools/index.js';
 import {
   initializeObsidianMemory,
   readObsidianContext,
@@ -305,6 +306,8 @@ async function runOpenRouter(
   }
 }
 
+const MAX_TOOL_ROUNDS = 5; // prevent infinite tool call loops
+
 async function runDeepSeekDirect(
   model: string,
   prompt: string,
@@ -324,55 +327,135 @@ async function runDeepSeekDirect(
     history.shift();
   }
 
-  const messages = [
+  // Build messages with full type for tool call fields
+  const messages: Array<Record<string, unknown>> = [
     { role: 'system', content: systemPrompt },
     ...history,
   ];
 
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), AGENT_TIMEOUT);
+  const tools = getToolDefinitions();
 
-    const response = await fetch(`${DEEPSEEK_API_BASE_URL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
-      },
-      body: JSON.stringify({
+  try {
+    let finalResult = '';
+
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), AGENT_TIMEOUT);
+
+      const body: Record<string, unknown> = {
         model,
         messages,
         stream: false,
-      }),
-      signal: controller.signal,
-    });
+      };
 
-    clearTimeout(timeout);
+      // Only include tools on first rounds (not after all tools resolved)
+      if (tools.length > 0) {
+        body.tools = tools;
+        body.tool_choice = 'auto';
+      }
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`DeepSeek API error ${response.status}: ${errorText}`);
+      const response = await fetch(`${DEEPSEEK_API_BASE_URL}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`DeepSeek API error ${response.status}: ${errorText}`);
+      }
+
+      const data = (await response.json()) as {
+        choices?: Array<{
+          message?: {
+            role?: string;
+            content?: string | null;
+            tool_calls?: Array<{
+              id: string;
+              type: string;
+              function: { name: string; arguments: string };
+            }>;
+          };
+          finish_reason?: string;
+        }>;
+      };
+
+      const choice = data.choices?.[0];
+      const msg = choice?.message;
+
+      if (!msg) throw new Error('No message in DeepSeek response');
+
+      // Check for tool calls
+      if (msg.tool_calls && msg.tool_calls.length > 0) {
+        // Append assistant message with tool_calls to messages
+        messages.push({
+          role: 'assistant',
+          content: msg.content || null,
+          tool_calls: msg.tool_calls,
+        });
+
+        // Execute each tool call
+        for (const tc of msg.tool_calls) {
+          const handler = getToolHandler(tc.function.name);
+          let toolResult: string;
+
+          if (!handler) {
+            toolResult = `Error: unknown tool "${tc.function.name}"`;
+          } else {
+            try {
+              const args = JSON.parse(tc.function.arguments);
+              logger.info(
+                { tool: tc.function.name, args, round },
+                'Executing tool call',
+              );
+              toolResult = await handler(args);
+            } catch (err) {
+              toolResult = `Tool error: ${err instanceof Error ? err.message : String(err)}`;
+            }
+          }
+
+          // Append tool result
+          messages.push({
+            role: 'tool',
+            tool_call_id: tc.id,
+            content: toolResult,
+          });
+
+          logger.info(
+            { tool: tc.function.name, resultLength: toolResult.length, round },
+            'Tool call completed',
+          );
+        }
+
+        // Continue loop — send tool results back to LLM
+        continue;
+      }
+
+      // No tool calls — final text response
+      finalResult = (msg.content || '').trim();
+      break;
     }
 
-    const data = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-
-    const result = data.choices?.[0]?.message?.content?.trim() || '';
-    history.push({ role: 'assistant', content: result });
+    history.push({ role: 'assistant', content: finalResult });
 
     logger.info(
-      { model, group: groupFolder, responseLength: result.length },
+      { model, group: groupFolder, responseLength: finalResult.length },
       'DeepSeek direct response received',
     );
 
-    if (userText.length > 100 || result.length > 100) {
+    if (userText.length > 100 || finalResult.length > 100) {
       writeObsidianContext(
-        `## Last DeepSeek Exchange\n\nUser: ${userText.slice(0, 200)}\n\nAssistant: ${result.slice(0, 200)}`,
+        `## Last DeepSeek Exchange\n\nUser: ${userText.slice(0, 200)}\n\nAssistant: ${finalResult.slice(0, 200)}`,
       );
     }
 
-    return { status: 'success', result };
+    return { status: 'success', result: finalResult };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     logger.error({ model, group: groupFolder, error: message }, 'DeepSeek direct error');
