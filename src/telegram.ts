@@ -174,10 +174,28 @@ export async function connectTelegram(
     'Connected to Telegram (grammY)',
   );
 
-  // Start long polling with built-in retry/backoff
-  bot.start({
-    onStart: () => logger.info('Telegram polling started'),
-    drop_pending_updates: true,
+  // Start long polling with retry on 409 conflict
+  const startPolling = async (attempt = 1): Promise<void> => {
+    try {
+      await bot!.start({
+        onStart: () => logger.info('Telegram polling started'),
+        drop_pending_updates: true,
+      });
+    } catch (err) {
+      if (err instanceof GrammyError && err.error_code === 409) {
+        const delay = Math.min(5000 * attempt, 30000);
+        logger.warn(
+          { attempt, delayMs: delay },
+          'Telegram 409 conflict — another poller active, retrying',
+        );
+        await new Promise((r) => setTimeout(r, delay));
+        return startPolling(attempt + 1);
+      }
+      throw err;
+    }
+  };
+  startPolling().catch((err) => {
+    logger.error({ err }, 'Telegram polling failed permanently');
   });
 }
 
