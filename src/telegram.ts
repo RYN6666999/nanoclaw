@@ -199,6 +199,88 @@ export async function connectTelegram(
   });
 }
 
+/**
+ * Convert LLM Markdown output to Telegram-compatible HTML.
+ * Telegram supports: <b>, <i>, <code>, <pre>, <a href="">, <s>, <u>
+ */
+function markdownToTelegramHtml(md: string): string {
+  const escHtml = (s: string) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  const lines = md.split('\n');
+  const out: string[] = [];
+  let inCodeBlock = false;
+  let codeBlockLines: string[] = [];
+
+  for (const line of lines) {
+    // Code block fence
+    if (line.trimStart().startsWith('```')) {
+      if (inCodeBlock) {
+        // Close code block
+        out.push(`<pre>${escHtml(codeBlockLines.join('\n'))}</pre>`);
+        codeBlockLines = [];
+        inCodeBlock = false;
+      } else {
+        inCodeBlock = true;
+      }
+      continue;
+    }
+    if (inCodeBlock) {
+      codeBlockLines.push(line);
+      continue;
+    }
+
+    // Skip markdown table separator rows (|---|---|)
+    if (/^\|[\s\-:|]+\|$/.test(line.trim())) continue;
+
+    // Convert table rows: | a | b | → a  b
+    let processed = line;
+    if (/^\|.*\|$/.test(processed.trim())) {
+      processed = processed
+        .trim()
+        .slice(1, -1)              // remove outer pipes
+        .split('|')
+        .map((cell) => cell.trim())
+        .join('  ');
+    }
+
+    // Escape HTML entities first
+    processed = escHtml(processed);
+
+    // Inline code (before bold/italic to avoid conflicts)
+    processed = processed.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+    // Bold: **text** or __text__
+    processed = processed.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+    processed = processed.replace(/__(.+?)__/g, '<b>$1</b>');
+
+    // Italic: *text* or _text_ (but not inside words like file_name)
+    processed = processed.replace(/(?<!\w)\*([^*]+)\*(?!\w)/g, '<i>$1</i>');
+    processed = processed.replace(/(?<!\w)_([^_]+)_(?!\w)/g, '<i>$1</i>');
+
+    // Strikethrough: ~~text~~
+    processed = processed.replace(/~~(.+?)~~/g, '<s>$1</s>');
+
+    // Markdown links: [text](url)
+    processed = processed.replace(
+      /\[([^\]]+)\]\(([^)]+)\)/g,
+      '<a href="$2">$1</a>',
+    );
+
+    // Headers: # → bold
+    processed = processed.replace(/^#{1,6}\s+(.+)/, '<b>$1</b>');
+
+    out.push(processed);
+  }
+
+  // Unclosed code block
+  if (inCodeBlock && codeBlockLines.length > 0) {
+    out.push(`<pre>${escHtml(codeBlockLines.join('\n'))}</pre>`);
+  }
+
+  return out.join('\n');
+}
+
 export async function sendTelegramMessage(
   chatId: number,
   text: string,
@@ -207,10 +289,22 @@ export async function sendTelegramMessage(
     logger.error('Telegram bot not initialized');
     return;
   }
+  const html = markdownToTelegramHtml(text);
   try {
-    await bot.api.sendMessage(chatId, text);
+    await bot.api.sendMessage(chatId, html, { parse_mode: 'HTML' });
     logger.info({ chatId, length: text.length }, 'Telegram message sent');
   } catch (err) {
+    // Fallback: if HTML parse fails, send as plain text
+    if (err instanceof GrammyError && err.error_code === 400) {
+      logger.warn({ chatId }, 'HTML parse failed, falling back to plain text');
+      try {
+        await bot.api.sendMessage(chatId, text);
+        return;
+      } catch (fallbackErr) {
+        logger.error({ chatId, err: fallbackErr }, 'Plain text fallback also failed');
+        return;
+      }
+    }
     if (err instanceof GrammyError) {
       logger.error(
         { chatId, code: err.error_code, description: err.description },
