@@ -11,6 +11,7 @@ import { obsidianNote } from './obsidian-note.js';
 import { tuneLocal } from './tune-local.js';
 import { editFile } from './edit-file.js';
 import { grepSearch } from './grep.js';
+import { generateImage } from './generate-image.js';
 
 export interface ToolDefinition {
   type: 'function';
@@ -40,6 +41,7 @@ const TOOLS: Tool[] = [
   tuneLocal,
   editFile,
   grepSearch,
+  generateImage,
 ];
 
 /** Tool definitions array for the API request */

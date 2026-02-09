@@ -5,14 +5,11 @@ import path from 'path';
 import {
   DATA_DIR,
   GROUPS_DIR,
-  MAIN_GROUP_FOLDER,
   SCHEDULER_POLL_INTERVAL,
   TIMEZONE,
 } from './config.js';
-import { writeTasksSnapshot } from './container-runner.js';
 import { runHostAgent } from './host-agent.js';
 import {
-  getAllTasks,
   getDueTasks,
   getTaskById,
   logTaskRun,
@@ -61,23 +58,6 @@ async function runTask(
     return;
   }
 
-  // Update tasks snapshot for container to read (filtered by group)
-  const isMain = task.group_folder === MAIN_GROUP_FOLDER;
-  const tasks = getAllTasks();
-  writeTasksSnapshot(
-    task.group_folder,
-    isMain,
-    tasks.map((t) => ({
-      id: t.id,
-      groupFolder: t.group_folder,
-      prompt: t.prompt,
-      schedule_type: t.schedule_type,
-      schedule_value: t.schedule_value,
-      status: t.status,
-      next_run: t.next_run,
-    })),
-  );
-
   let result: string | null = null;
   let error: string | null = null;
 
@@ -92,7 +72,7 @@ async function runTask(
       sessionId,
       groupFolder: task.group_folder,
       chatJid: task.chat_jid,
-      isMain,
+      isMain: task.group_folder === 'main',
       isScheduledTask: true,
     });
 

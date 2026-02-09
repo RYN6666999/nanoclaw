@@ -1,14 +1,12 @@
 /**
  * Host Agent for NanoClaw
- * Runs agents via local LLM (Ollama/LM Studio), OpenRouter (complex tasks), or Claude CLI.
+ * Routes to DeepSeek (primary), OpenRouter, Gemini, or Local LLM.
  */
-import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
 import {
   AGENT_TIMEOUT,
-  CLAUDE_CLI_PATH,
   DEEPSEEK_API_BASE_URL,
   DEEPSEEK_API_KEY,
   GEMINI_API_KEY,
@@ -20,7 +18,8 @@ import {
   OPENROUTER_API_KEY,
 } from './config.js';
 import { logger } from './logger.js';
-import { routeMessage, formatRouteSignature } from './model-router.js';
+import { routeMessage, formatRouteSignature, getFallbackChain } from './model-router.js';
+import type { Backend } from './model-router.js';
 import { getToolDefinitions, getToolHandler } from './tools/index.js';
 import {
   initializeObsidianMemory,
@@ -40,6 +39,10 @@ export interface HostAgentInput {
   onStreamChunk?: (chunk: string) => Promise<void>;
   /** Called when streaming is done */
   onStreamDone?: () => Promise<string>;
+  /** Base64-encoded image data for vision requests */
+  imageBase64?: string;
+  /** MIME type of the image (e.g. 'image/jpeg') */
+  imageMimeType?: string;
 }
 
 export interface HostAgentOutput {
@@ -55,6 +58,22 @@ const conversationHistory: Record<
   Array<{ role: 'user' | 'assistant'; content: string }>
 > = {};
 const MAX_HISTORY = 20;
+
+/**
+ * Strip leaked function call XML/DSML from model output.
+ * DeepSeek sometimes outputs raw function call syntax in text instead of tool_calls.
+ */
+function cleanModelOutput(text: string): string {
+  return text
+    // DeepSeek DSML function call leaks
+    .replace(/<｜DSML｜[^>]*>[\s\S]*?(?:<\/｜DSML｜[^>]*>|$)/g, '')
+    // Generic XML function call leaks
+    .replace(/<function_calls>[\s\S]*?(?:<\/function_calls>|$)/g, '')
+    .replace(/<invoke[\s\S]*?(?:<\/invoke>|$)/g, '')
+    // Strip <think> blocks
+    .replace(/<think>[\s\S]*?<\/think>/g, '')
+    .trim();
+}
 
 const AGENT_SOUL_COMPACT = `
 ## Agent Soul（精實原則）
@@ -213,11 +232,11 @@ async function runOpenRouter(
   model: string,
   prompt: string,
   groupFolder: string,
+  input?: HostAgentInput,
 ): Promise<HostAgentOutput> {
   const systemPrompt = getSystemPrompt(groupFolder, 'openrouter');
   const userText = extractMessagesForLocal(prompt);
 
-  // Manage conversation history (separate from local)
   const historyKey = `openrouter_${groupFolder}`;
   if (!conversationHistory[historyKey]) {
     conversationHistory[historyKey] = [];
@@ -234,35 +253,23 @@ async function runOpenRouter(
     ...history,
   ];
 
+  const canStream = !!(input?.onStreamChunk);
+
+  // Models known to NOT support function calling
+  const NO_TOOLS_MODELS = ['x-ai/grok', 'mistral', 'llama'];
+  const supportsTools = !NO_TOOLS_MODELS.some(prefix => model.includes(prefix));
+
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), AGENT_TIMEOUT);
 
-    // OpenRouter supports tools/functions for search and other operations
-    const tools = [
-      {
-        type: 'function',
-        function: {
-          name: 'search',
-          description: 'Search the web for current information using X (Twitter) and web search',
-          parameters: {
-            type: 'object',
-            properties: {
-              query: {
-                type: 'string',
-                description: 'The search query to execute',
-              },
-              source: {
-                type: 'string',
-                enum: ['web', 'twitter', 'x'],
-                description: 'Where to search: web, twitter, or x (default: web)',
-              },
-            },
-            required: ['query'],
-          },
-        },
-      },
-    ];
+    const body: Record<string, unknown> = { model, messages, stream: canStream };
+
+    // Only send tools to models that support function calling
+    if (supportsTools) {
+      body.tools = getToolDefinitions();
+      body.tool_choice = 'auto';
+    }
 
     const response = await fetch(`${OPENROUTER_API_BASE_URL}/chat/completions`, {
       method: 'POST',
@@ -270,12 +277,7 @@ async function runOpenRouter(
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
       },
-      body: JSON.stringify({
-        model,
-        messages,
-        tools,
-        stream: false,
-      }),
+      body: JSON.stringify(body),
       signal: controller.signal,
     });
 
@@ -286,57 +288,88 @@ async function runOpenRouter(
       throw new Error(`OpenRouter API error ${response.status}: ${errorText}`);
     }
 
-    const data = (await response.json()) as {
-      choices?: Array<{
-        message?: {
-          content?: string;
-          tool_calls?: Array<{
-            id: string;
-            function: { name: string; arguments: string };
-          }>;
-        };
-      }>;
-    };
+    let result = '';
 
-    const message = data.choices?.[0]?.message;
-    let result = message?.content || '';
+    if (canStream) {
+      let toolCalls: Array<{
+        id: string; type: string;
+        function: { name: string; arguments: string };
+      }> | null = null;
 
-    // Handle tool calls (search, etc.)
-    if (message?.tool_calls && message.tool_calls.length > 0) {
-      const toolCall = message.tool_calls[0];
-      const args = JSON.parse(toolCall.function.arguments) as {
-        query?: string;
-        source?: string;
+      for await (const event of parseSSEStream(response)) {
+        if (event.type === 'delta' && event.content) {
+          result += event.content;
+          await input!.onStreamChunk!(event.content);
+        } else if (event.type === 'tool_calls') {
+          toolCalls = event.tool_calls || null;
+        }
+      }
+
+      // Handle tool calls (same logic as DeepSeek)
+      if (toolCalls && toolCalls.length > 0 && supportsTools) {
+        for (const tc of toolCalls) {
+          const handler = getToolHandler(tc.function.name);
+          let toolResult: string;
+          if (!handler) {
+            toolResult = `Error: unknown tool "${tc.function.name}"`;
+          } else {
+            try {
+              const args = JSON.parse(tc.function.arguments);
+              logger.info({ tool: tc.function.name, args }, 'Executing OpenRouter tool call');
+              if (input?.onStreamChunk) await input.onStreamChunk(`\n⚙️ ${tc.function.name}...\n`);
+              toolResult = await handler(args);
+            } catch (err) {
+              toolResult = `Tool error: ${err instanceof Error ? err.message : String(err)}`;
+            }
+          }
+          logger.info({ tool: tc.function.name, resultLength: toolResult.length }, 'OpenRouter tool completed');
+          // For now, append tool result as text (OpenRouter doesn't always support multi-turn tool calls)
+          result += `\n${toolResult}`;
+        }
+      }
+      result = result.trim();
+    } else {
+      const data = (await response.json()) as {
+        choices?: Array<{
+          message?: {
+            content?: string;
+            tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }>;
+          };
+        }>;
       };
 
-      // Log the search attempt
-      logger.info(
-        { tool: toolCall.function.name, query: args.query, source: args.source },
-        'OpenRouter triggered tool call',
-      );
+      const msg = data.choices?.[0]?.message;
+      result = msg?.content || '';
 
-      // Add tool call context to result
-      if (!result) {
-        result = `Searching for: "${args.query}" (via ${args.source || 'web'})...`;
+      if (msg?.tool_calls && msg.tool_calls.length > 0 && supportsTools) {
+        for (const tc of msg.tool_calls) {
+          const handler = getToolHandler(tc.function.name);
+          if (handler) {
+            try {
+              const args = JSON.parse(tc.function.arguments);
+              logger.info({ tool: tc.function.name, args }, 'Executing OpenRouter tool call');
+              const toolResult = await handler(args);
+              result += `\n${toolResult}`;
+            } catch (err) {
+              logger.error({ tool: tc.function.name, err }, 'OpenRouter tool error');
+            }
+          }
+        }
       }
+      result = result.trim();
     }
 
-    const cleaned = result.trim();
-    history.push({ role: 'assistant', content: cleaned });
+    history.push({ role: 'assistant', content: result });
 
-    logger.info(
-      { model, group: groupFolder, responseLength: cleaned.length },
-      'OpenRouter response received',
-    );
+    logger.info({ model, group: groupFolder, responseLength: result.length }, 'OpenRouter response received');
 
-    // Save important exchanges to Obsidian
-    if (userText.length > 100 || cleaned.length > 100) {
+    if (userText.length > 100 || result.length > 100) {
       writeObsidianContext(
-        `## Last OpenRouter Exchange\n\nUser: ${userText.slice(0, 200)}\n\nAssistant: ${cleaned.slice(0, 200)}`,
+        `## Last OpenRouter Exchange\n\nUser: ${userText.slice(0, 200)}\n\nAssistant: ${result.slice(0, 200)}`,
       );
     }
 
-    return { status: 'success', result: cleaned };
+    return { status: 'success', result };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     logger.error({ model, group: groupFolder, error: message }, 'OpenRouter error');
@@ -500,6 +533,8 @@ async function runDeepSeekDirect(
         body.tools = tools;
         body.tool_choice = 'auto';
       }
+
+      logger.info({ model, toolCount: tools.length, round, stream: useStream }, 'DeepSeek API request');
 
       const response = await fetch(`${DEEPSEEK_API_BASE_URL}/chat/completions`, {
         method: 'POST',
@@ -784,194 +819,115 @@ async function runGemini(
   }
 }
 
-async function runClaudeCli(
-  prompt: string,
-  sessionId: string | undefined,
+/**
+ * Gemini Vision: analyze image with optional text prompt.
+ */
+async function runGeminiVision(
+  imageBase64: string,
+  mimeType: string,
+  textPrompt: string,
   groupFolder: string,
-  isMain: boolean,
 ): Promise<HostAgentOutput> {
-  const groupDir = path.join(GROUPS_DIR, groupFolder);
-  const systemPrompt = getSystemPrompt(groupFolder, 'claude');
-
-  const args: string[] = [
-    '-p', prompt,
-    '--output-format', 'json',
-    '--dangerously-skip-permissions',
-    '--allowed-tools', 'Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch',
-    '--add-dir', groupDir,
-  ];
-
-  if (sessionId) {
-    args.push('--resume', sessionId);
+  if (!GEMINI_API_KEY) {
+    return { status: 'error', result: null, error: 'Gemini API key not configured' };
   }
 
-  if (isMain) {
-    const projectRoot = process.cwd();
-    args.push('--add-dir', projectRoot);
-  }
+  const systemPrompt = getSystemPrompt(groupFolder, 'gemini');
 
-  args.push('--system-prompt', systemPrompt);
+  const parts: Array<Record<string, unknown>> = [];
 
-  logger.info(
-    { group: groupFolder, hasSession: !!sessionId, isMain },
-    'Spawning Claude CLI',
-  );
+  // System instruction as text
+  parts.push({ text: `System instructions:\n${systemPrompt}` });
 
-  return new Promise((resolve) => {
-    const proc = spawn(CLAUDE_CLI_PATH, args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env },
-    });
-
-    let stdout = '';
-    let stderr = '';
-
-    proc.stdout.on('data', (data) => {
-      stdout += data.toString();
-    });
-
-    proc.stderr.on('data', (data) => {
-      const chunk = data.toString();
-      stderr += chunk;
-      for (const line of chunk.trim().split('\n')) {
-        if (line) logger.debug({ claude: groupFolder }, line);
-      }
-    });
-
-    let timedOut = false;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      logger.error({ group: groupFolder }, 'Claude CLI timeout, killing');
-      proc.kill('SIGTERM');
-      setTimeout(() => proc.kill('SIGKILL'), 5000);
-    }, AGENT_TIMEOUT);
-
-    proc.on('close', (code) => {
-      clearTimeout(timeout);
-
-      if (timedOut) {
-        resolve({
-          status: 'error',
-          result: null,
-          error: `Claude CLI timed out after ${AGENT_TIMEOUT}ms`,
-        });
-        return;
-      }
-
-      if (code !== 0) {
-        logger.error(
-          { group: groupFolder, code, stderr: stderr.slice(-500) },
-          'Claude CLI exited with error',
-        );
-        resolve({
-          status: 'error',
-          result: null,
-          error: `Claude CLI exited with code ${code}: ${stderr.slice(-200)}`,
-        });
-        return;
-      }
-
-      try {
-        const output = JSON.parse(stdout);
-        const result = output.result || output.text || stdout;
-        const newSessionId = output.session_id || undefined;
-
-        logger.info(
-          { group: groupFolder, hasSession: !!newSessionId },
-          'Claude CLI completed',
-        );
-
-        resolve({
-          status: 'success',
-          result: typeof result === 'string' ? result : JSON.stringify(result),
-          newSessionId,
-        });
-      } catch {
-        if (stdout.trim()) {
-          resolve({ status: 'success', result: stdout.trim() });
-        } else {
-          resolve({
-            status: 'error',
-            result: null,
-            error: `Failed to parse Claude CLI output. stderr: ${stderr.slice(-200)}`,
-          });
-        }
-      }
-    });
-
-    proc.on('error', (err) => {
-      clearTimeout(timeout);
-      logger.error({ group: groupFolder, error: err }, 'Claude CLI spawn error');
-      resolve({
-        status: 'error',
-        result: null,
-        error: `Claude CLI spawn error: ${err.message}`,
-      });
-    });
+  // Image
+  parts.push({
+    inline_data: {
+      mime_type: mimeType,
+      data: imageBase64,
+    },
   });
-}
 
-async function runOpenCode(
-  prompt: string,
-  groupFolder: string,
-): Promise<HostAgentOutput> {
-  const userText = extractMessagesForLocal(prompt);
+  // User text (caption or default)
+  parts.push({ text: textPrompt || '描述這張圖片' });
 
-  logger.info({ group: groupFolder }, 'Spawning OpenCode CLI');
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), AGENT_TIMEOUT);
 
-  return new Promise((resolve) => {
-    const env = { ...process.env };
-    // Ensure homebrew bin is in PATH for opencode binary
-    if (!env.PATH?.includes('/opt/homebrew/bin')) {
-      env.PATH = `/opt/homebrew/bin:${env.PATH || ''}`;
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts }],
+          generationConfig: { temperature: 0.7 },
+        }),
+        signal: controller.signal,
+      },
+    );
+
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Gemini Vision API error ${response.status}: ${errorText}`);
     }
 
-    const proc = spawn('opencode', ['run', userText, '--format', 'default'], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env,
-      cwd: path.join(GROUPS_DIR, groupFolder),
-    });
+    const data = (await response.json()) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
 
-    let stdout = '';
-    let stderr = '';
+    const result = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
 
-    proc.stdout.on('data', (d) => { stdout += d.toString(); });
-    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    logger.info(
+      { group: groupFolder, responseLength: result.length },
+      'Gemini Vision response received',
+    );
 
-    let timedOut = false;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      proc.kill('SIGTERM');
-      setTimeout(() => proc.kill('SIGKILL'), 5000);
-    }, AGENT_TIMEOUT);
+    return { status: 'success', result };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.error({ group: groupFolder, error: message }, 'Gemini Vision error');
+    return { status: 'error', result: null, error: message };
+  }
+}
 
-    proc.on('close', (code) => {
-      clearTimeout(timeout);
+// Frozen backends — return error with suggestion to use terminal directly
+async function runClaudeCli(): Promise<HostAgentOutput> {
+  return { status: 'error', result: '此功能已凍結。請直接在終端使用 Claude Code。', error: 'frozen' };
+}
 
-      if (timedOut) {
-        resolve({ status: 'error', result: null, error: 'OpenCode CLI timed out' });
-        return;
-      }
+async function runOpenCode(): Promise<HostAgentOutput> {
+  return { status: 'error', result: '此功能已凍結。請直接在終端使用 OpenCode。', error: 'frozen' };
+}
 
-      if (code !== 0 && !stdout.trim()) {
-        resolve({ status: 'error', result: null, error: `OpenCode exited ${code}: ${stderr.slice(-200)}` });
-        return;
-      }
-
-      try {
-        const data = JSON.parse(stdout);
-        const result = data.result || data.output || data.text || stdout;
-        resolve({ status: 'success', result: typeof result === 'string' ? result : JSON.stringify(result) });
-      } catch {
-        resolve({ status: 'success', result: stdout.trim() || stderr.trim() || '(no output)' });
-      }
-    });
-
-    proc.on('error', (err) => {
-      clearTimeout(timeout);
-      resolve({ status: 'error', result: null, error: `OpenCode spawn error: ${err.message}` });
-    });
-  });
+/**
+ * Dispatch a single backend call.
+ */
+async function dispatchBackend(
+  backend: Backend,
+  model: string,
+  prompt: string,
+  groupFolder: string,
+  input: HostAgentInput,
+): Promise<HostAgentOutput> {
+  switch (backend) {
+    case 'local':
+      return runLocal(model, prompt, groupFolder);
+    case 'deepseek-direct':
+      return runDeepSeekDirect(model, prompt, groupFolder, input);
+    case 'gemini':
+      return runGemini(model, prompt, groupFolder);
+    case 'openrouter':
+      return runOpenRouter(model, prompt, groupFolder, input);
+    case 'opencode':
+      return runOpenCode();
+    case 'claude':
+      return runClaudeCli();
+    default:
+      return { status: 'error', result: null, error: `Unknown backend: ${backend}` };
+  }
 }
 
 export async function runHostAgent(
@@ -982,6 +938,26 @@ export async function runHostAgent(
   initializeObsidianMemory();
 
   const startTime = Date.now();
+
+  // Vision shortcut: image → Gemini Vision directly (skip model-router)
+  if (input.imageBase64 && input.imageMimeType) {
+    logger.info({ group: group.name }, 'Routing image to Gemini Vision');
+    const userText = extractMessagesForLocal(input.prompt);
+    let output = await runGeminiVision(
+      input.imageBase64,
+      input.imageMimeType,
+      userText,
+      input.groupFolder,
+    );
+    if (output.result) {
+      output.result = cleanModelOutput(output.result);
+      output.result = `${output.result}\n[圖片 → ${GEMINI_MODEL}]`;
+    }
+    const duration = Date.now() - startTime;
+    logger.info({ group: group.name, backend: 'gemini-vision', duration, status: output.status }, 'Vision completed');
+    return output;
+  }
+
   const route = routeMessage(input.prompt, !!input.isScheduledTask);
 
   logger.info(
@@ -994,25 +970,33 @@ export async function runHostAgent(
     'Routing message',
   );
 
-  let output: HostAgentOutput;
+  let output = await dispatchBackend(route.backend, route.model, route.prompt, input.groupFolder, input);
+  let usedBackend = route.backend;
+  let usedModel = route.model;
 
-  if (route.backend === 'local') {
-    output = await runLocal(route.model, route.prompt, input.groupFolder);
-  } else if (route.backend === 'deepseek-direct') {
-    output = await runDeepSeekDirect(route.model, route.prompt, input.groupFolder, input);
-  } else if (route.backend === 'gemini') {
-    output = await runGemini(route.model, route.prompt, input.groupFolder);
-  } else if (route.backend === 'openrouter') {
-    output = await runOpenRouter(route.model, route.prompt, input.groupFolder);
-  } else if (route.backend === 'opencode') {
-    output = await runOpenCode(route.prompt, input.groupFolder);
-  } else {
-    output = await runClaudeCli(
-      route.prompt,
-      input.sessionId,
-      input.groupFolder,
-      input.isMain,
-    );
+  // Fallback chain: if primary fails, try alternatives (including prefix commands)
+  if (output.status === 'error') {
+    const fallbacks = getFallbackChain(route.backend);
+    for (const fb of fallbacks) {
+      logger.warn(
+        { group: group.name, failedBackend: usedBackend, tryingBackend: fb.backend, tryingModel: fb.model },
+        'Backend failed, trying fallback',
+      );
+      output = await dispatchBackend(fb.backend, fb.model, route.prompt, input.groupFolder, input);
+      usedBackend = fb.backend;
+      usedModel = fb.model;
+      if (output.status === 'success') {
+        route.reason = 'fallback';
+        route.backend = fb.backend;
+        route.model = fb.model;
+        break;
+      }
+    }
+  }
+
+  // Clean leaked XML/function call syntax from output
+  if (output.result) {
+    output.result = cleanModelOutput(output.result);
   }
 
   // Append route signature to result
@@ -1024,8 +1008,8 @@ export async function runHostAgent(
   logger.info(
     {
       group: group.name,
-      backend: route.backend,
-      model: route.model,
+      backend: usedBackend,
+      model: usedModel,
       reason: route.reason,
       duration,
       status: output.status,
@@ -1119,27 +1103,6 @@ export async function ensureBackendsAvailable(): Promise<void> {
     }
   } else {
     logger.info('Gemini API key not configured');
-  }
-
-  // Check claude CLI
-  try {
-    const proc = spawn(CLAUDE_CLI_PATH, ['--version'], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      timeout: 5000,
-    });
-    const version = await new Promise<string>((resolve) => {
-      let out = '';
-      proc.stdout.on('data', (d) => (out += d.toString()));
-      proc.on('close', () => resolve(out.trim()));
-      proc.on('error', () => resolve(''));
-    });
-    if (version) {
-      logger.info({ version }, 'Claude CLI available');
-    } else {
-      logger.warn('Claude CLI not found — /claude commands will fail');
-    }
-  } catch {
-    logger.warn('Claude CLI not available');
   }
 
   // Initialize Obsidian memory

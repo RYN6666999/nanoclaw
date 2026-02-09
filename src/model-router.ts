@@ -15,9 +15,9 @@ import {
   ROUTER_CONFIG,
 } from './config.js';
 
-export type Backend = 'local' | 'gemini' | 'openrouter' | 'deepseek-direct' | 'claude';
+export type Backend = 'local' | 'gemini' | 'openrouter' | 'deepseek-direct' | 'claude' | 'opencode';
 
-export type RouteReason = 'prefix' | 'search' | 'complex' | 'long-doc' | 'default' | 'scheduled';
+export type RouteReason = 'prefix' | 'search' | 'complex' | 'long-doc' | 'default' | 'scheduled' | 'fallback';
 
 export interface RouteResult {
   backend: Backend;
@@ -35,6 +35,7 @@ const PREFIX_MAP: Record<string, { backend: Backend; model: string }> = {
   '/gemini': { backend: 'gemini', model: GEMINI_MODEL },
   '/x': { backend: 'openrouter', model: 'x-ai/grok-4.1-fast' },
   '/local': { backend: 'local', model: DEFAULT_LOCAL_MODEL },
+  '/code': { backend: 'opencode', model: 'opencode' },
 };
 
 const COMPLEX_KEYWORDS = ROUTER_CONFIG?.complex_keywords || [
@@ -149,7 +150,45 @@ const REASON_LABELS: Record<RouteReason, string> = {
   'long-doc': '長文',
   default: '預設',
   scheduled: '排程',
+  fallback: '降級',
 };
+
+/**
+ * Fallback chain: when a backend fails, try the next one.
+ * Order: deepseek-direct → openrouter → gemini → local
+ */
+const FALLBACK_CHAIN: Array<{ backend: Backend; model: string }> = [
+  { backend: 'deepseek-direct', model: 'deepseek-chat' },
+  { backend: 'openrouter', model: 'deepseek/deepseek-chat' },
+  { backend: 'gemini', model: 'gemini-2.0-flash' },
+  { backend: 'local', model: 'llama-3.2-3b-instruct' },
+];
+
+/**
+ * Check if a backend has the required API key configured.
+ */
+function hasApiKey(backend: Backend): boolean {
+  switch (backend) {
+    case 'deepseek-direct': return !!DEEPSEEK_API_KEY;
+    case 'openrouter': return !!OPENROUTER_API_KEY;
+    case 'gemini': return !!GEMINI_API_KEY;
+    case 'local': return true; // no key needed
+    case 'claude': return true; // uses CLI auth
+    default: return false;
+  }
+}
+
+/**
+ * Get fallback backends to try after the primary fails.
+ * Excludes the failed backend and checks both enabled status AND API key availability.
+ */
+export function getFallbackChain(failedBackend: Backend): Array<{ backend: Backend; model: string }> {
+  return FALLBACK_CHAIN.filter((f) =>
+    f.backend !== failedBackend &&
+    isBackendEnabled(f.backend) &&
+    hasApiKey(f.backend),
+  );
+}
 
 /**
  * Format route signature for display, e.g. "[/deepseek → deepseek-chat]"

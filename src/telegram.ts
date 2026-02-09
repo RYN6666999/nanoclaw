@@ -2,7 +2,9 @@
  * Telegram Channel for NanoClaw
  * Uses grammY for robust polling with built-in retry/backoff.
  */
-import { Bot, GrammyError, HttpError } from 'grammy';
+import fs from 'fs';
+
+import { Bot, GrammyError, HttpError, InputFile } from 'grammy';
 
 import { ASSISTANT_NAME, MAIN_GROUP_FOLDER } from './config.js';
 import {
@@ -35,6 +37,8 @@ interface TelegramConfig {
       onStreamChunk: (chunk: string) => Promise<void>;
       onStreamDone: () => Promise<string>;
     },
+    imageBase64?: string,
+    imageMimeType?: string,
   ) => Promise<string | null>;
   getRegisteredGroups: () => Record<string, RegisteredGroup>;
   getSessions: () => Record<string, string>;
@@ -70,6 +74,98 @@ export async function connectTelegram(
       logger.error({ err: e.message }, 'Telegram HTTP/network error');
     } else {
       logger.error({ err: e, updateId: ctx?.update?.update_id }, 'Telegram handler error');
+    }
+  });
+
+  // Handle photo messages
+  bot.on('message:photo', async (ctx) => {
+    const msg = ctx.message;
+    const botId = ctx.me.id;
+    if (msg.from.id === botId) return;
+
+    const chatJid = makeTelegramJid(msg.chat.id);
+    const timestamp = new Date(msg.date * 1000).toISOString();
+    const senderName =
+      msg.from.first_name ||
+      msg.from.username ||
+      String(msg.from.id);
+    const sender = String(msg.from.id);
+    const caption = msg.caption || '';
+
+    // Store caption as message text
+    storeTelegramMessage(
+      String(msg.message_id),
+      chatJid,
+      sender,
+      senderName,
+      caption || '[圖片]',
+      timestamp,
+      false,
+    );
+
+    // Check if this chat is registered
+    const registeredGroups = config.getRegisteredGroups();
+    const group = registeredGroups[chatJid];
+    if (!group) return;
+
+    // Get highest resolution photo
+    const photo = msg.photo[msg.photo.length - 1];
+    const file = await ctx.api.getFile(photo.file_id);
+    const fileUrl = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
+
+    // Download and convert to base64
+    let imageBase64: string;
+    try {
+      const res = await fetch(fileUrl);
+      if (!res.ok) throw new Error(`Failed to download photo: ${res.status}`);
+      const buffer = Buffer.from(await res.arrayBuffer());
+      imageBase64 = buffer.toString('base64');
+    } catch (err) {
+      logger.error({ err }, 'Failed to download Telegram photo');
+      return;
+    }
+
+    // Determine MIME type from file path
+    const ext = file.file_path?.split('.').pop()?.toLowerCase() || 'jpg';
+    const mimeMap: Record<string, string> = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp' };
+    const mimeType = mimeMap[ext] || 'image/jpeg';
+
+    logger.info(
+      { chat: msg.chat.id, fileSize: photo.file_size, mimeType },
+      'Processing Telegram photo',
+    );
+
+    // Keep typing indicator alive
+    await ctx.replyWithChatAction('typing');
+    const typingInterval = setInterval(async () => {
+      try {
+        await bot!.api.sendChatAction(msg.chat.id, 'typing');
+      } catch { /* best effort */ }
+    }, 4000);
+
+    // Build prompt with caption context
+    const prompt = caption
+      ? `<messages>\n<message sender="${senderName}" time="${timestamp}">${caption}</message>\n</messages>`
+      : `<messages>\n<message sender="${senderName}" time="${timestamp}">[用戶發送了一張圖片，請描述並分析]</message>\n</messages>`;
+
+    const response = await config.runAgent(group, prompt, chatJid, undefined, imageBase64, mimeType);
+    clearInterval(typingInterval);
+
+    if (response) {
+      config.lastAgentTimestamp[chatJid] = timestamp;
+      config.saveState();
+
+      storeTelegramMessage(
+        `bot-${Date.now()}`,
+        chatJid,
+        'bot',
+        ASSISTANT_NAME,
+        response,
+        new Date().toISOString(),
+        true,
+      );
+
+      await sendTelegramMessage(msg.chat.id, response);
     }
   });
 
@@ -127,9 +223,16 @@ export async function connectTelegram(
       }
     }
 
+    // Check trigger: 'all' = respond to everything, otherwise match pattern
+    if (group.trigger && group.trigger !== 'all') {
+      const triggerMatch = msg.text.includes(group.trigger) ||
+        msg.text.startsWith('/');  // slash commands always pass
+      if (!triggerMatch) return;
+    }
+
     // Build context from missed messages
     const sinceTimestamp = config.lastAgentTimestamp[chatJid] || '';
-    const missedMessages = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
+    const missedMessages = getMessagesSince(chatJid, sinceTimestamp);
 
     const lines = missedMessages.map((m) => {
       const escapeXml = (s: string) =>
@@ -181,7 +284,7 @@ export async function connectTelegram(
         chatJid,
         'bot',
         ASSISTANT_NAME,
-        `${ASSISTANT_NAME}: ${response}`,
+        response,
         new Date().toISOString(),
         true,
       );
@@ -315,6 +418,29 @@ export async function sendTelegramMessage(
     logger.error('Telegram bot not initialized');
     return;
   }
+
+  // Check for [IMAGE:/path] markers — send as photo
+  const imageMatch = text.match(/\[IMAGE:([^\]]+)\]/);
+  if (imageMatch) {
+    const imagePath = imageMatch[1];
+    const caption = text.replace(/\[IMAGE:[^\]]+\]\n?/, '').trim();
+
+    try {
+      if (fs.existsSync(imagePath)) {
+        await bot.api.sendPhoto(chatId, new InputFile(imagePath), {
+          caption: caption.slice(0, 1024), // TG caption limit
+        });
+        logger.info({ chatId, imagePath }, 'Telegram photo sent');
+        // Clean up temp file
+        fs.unlinkSync(imagePath);
+        return;
+      }
+    } catch (err) {
+      logger.error({ chatId, imagePath, err }, 'Failed to send Telegram photo');
+      // Fall through to send as text
+    }
+  }
+
   const html = markdownToTelegramHtml(text);
   try {
     await bot.api.sendMessage(chatId, html, { parse_mode: 'HTML' });

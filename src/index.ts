@@ -8,17 +8,8 @@ import {
   MAIN_GROUP_FOLDER,
   TIMEZONE,
 } from './config.js';
-import {
-  AvailableGroup,
-  writeGroupsSnapshot,
-  writeTasksSnapshot,
-} from './container-runner.js';
 import { ensureBackendsAvailable, runHostAgent } from './host-agent.js';
-import {
-  getAllChats,
-  getAllTasks,
-  initDatabase,
-} from './db.js';
+import { initDatabase } from './db.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { RegisteredGroup, Session } from './types.js';
 import { loadJson, saveJson } from './utils.js';
@@ -73,20 +64,6 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   );
 }
 
-function getAvailableGroups(): AvailableGroup[] {
-  const chats = getAllChats();
-  const registeredJids = new Set(Object.keys(registeredGroups));
-
-  return chats
-    .filter((c) => c.jid !== '__group_sync__')
-    .map((c) => ({
-      jid: c.jid,
-      name: c.name,
-      lastActivity: c.last_message_time,
-      isRegistered: registeredJids.has(c.jid),
-    }));
-}
-
 async function runAgent(
   group: RegisteredGroup,
   prompt: string,
@@ -95,32 +72,11 @@ async function runAgent(
     onStreamChunk: (chunk: string) => Promise<void>;
     onStreamDone: () => Promise<string>;
   },
+  imageBase64?: string,
+  imageMimeType?: string,
 ): Promise<string | null> {
   const isMain = group.folder === MAIN_GROUP_FOLDER;
   const sessionId = sessions[group.folder];
-
-  const tasks = getAllTasks();
-  writeTasksSnapshot(
-    group.folder,
-    isMain,
-    tasks.map((t) => ({
-      id: t.id,
-      groupFolder: t.group_folder,
-      prompt: t.prompt,
-      schedule_type: t.schedule_type,
-      schedule_value: t.schedule_value,
-      status: t.status,
-      next_run: t.next_run,
-    })),
-  );
-
-  const availableGroups = getAvailableGroups();
-  writeGroupsSnapshot(
-    group.folder,
-    isMain,
-    availableGroups,
-    new Set(Object.keys(registeredGroups)),
-  );
 
   try {
     const output = await runHostAgent(group, {
@@ -131,6 +87,8 @@ async function runAgent(
       isMain,
       onStreamChunk: streamCallbacks?.onStreamChunk,
       onStreamDone: streamCallbacks?.onStreamDone,
+      imageBase64,
+      imageMimeType,
     });
 
     if (output.newSessionId) {
@@ -157,10 +115,7 @@ async function sendMessage(jid: string, text: string): Promise<void> {
   try {
     if (isTelegramJid(jid)) {
       const chatId = getTelegramChatId(jid);
-      const cleanText = text.startsWith(`${ASSISTANT_NAME}: `)
-        ? text.slice(ASSISTANT_NAME.length + 2)
-        : text;
-      await sendTelegramMessage(chatId, cleanText);
+      await sendTelegramMessage(chatId, text);
     } else {
       logger.warn({ jid }, 'Non-Telegram JID, cannot send');
     }
@@ -215,7 +170,7 @@ function startIpcWatcher(): void {
                 ) {
                   await sendMessage(
                     data.chatJid,
-                    `${ASSISTANT_NAME}: ${data.text}`,
+                    data.text,
                   );
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup },
