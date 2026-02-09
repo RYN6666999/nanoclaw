@@ -91,6 +91,10 @@ async function runAgent(
   group: RegisteredGroup,
   prompt: string,
   chatJid: string,
+  streamCallbacks?: {
+    onStreamChunk: (chunk: string) => Promise<void>;
+    onStreamDone: () => Promise<string>;
+  },
 ): Promise<string | null> {
   const isMain = group.folder === MAIN_GROUP_FOLDER;
   const sessionId = sessions[group.folder];
@@ -125,6 +129,8 @@ async function runAgent(
       groupFolder: group.folder,
       chatJid,
       isMain,
+      onStreamChunk: streamCallbacks?.onStreamChunk,
+      onStreamDone: streamCallbacks?.onStreamDone,
     });
 
     if (output.newSessionId) {

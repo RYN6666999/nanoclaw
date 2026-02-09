@@ -36,6 +36,10 @@ export interface HostAgentInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  /** Callback for streaming text chunks to Telegram */
+  onStreamChunk?: (chunk: string) => Promise<void>;
+  /** Called when streaming is done */
+  onStreamDone?: () => Promise<string>;
 }
 
 export interface HostAgentOutput {
@@ -342,10 +346,116 @@ async function runOpenRouter(
 
 const MAX_TOOL_ROUNDS = 5; // prevent infinite tool call loops
 
+/**
+ * Parse SSE stream from DeepSeek API, yielding content deltas and tool calls.
+ */
+async function* parseSSEStream(response: Response): AsyncGenerator<{
+  type: 'delta' | 'tool_calls' | 'done';
+  content?: string;
+  tool_calls?: Array<{
+    id: string;
+    type: string;
+    function: { name: string; arguments: string };
+  }>;
+}> {
+  const reader = response.body?.getReader();
+  if (!reader) return;
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  // Accumulate tool call fragments across chunks
+  const toolCallAccum: Record<number, { id: string; type: string; function: { name: string; arguments: string } }> = {};
+  let hasToolCalls = false;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const data = line.slice(6).trim();
+      if (data === '[DONE]') {
+        if (hasToolCalls) {
+          yield {
+            type: 'tool_calls',
+            tool_calls: Object.values(toolCallAccum),
+          };
+        }
+        yield { type: 'done' };
+        return;
+      }
+
+      try {
+        const parsed = JSON.parse(data) as {
+          choices?: Array<{
+            delta?: {
+              content?: string | null;
+              tool_calls?: Array<{
+                index: number;
+                id?: string;
+                type?: string;
+                function?: { name?: string; arguments?: string };
+              }>;
+            };
+            finish_reason?: string | null;
+          }>;
+        };
+
+        const delta = parsed.choices?.[0]?.delta;
+        if (!delta) continue;
+
+        // Content delta
+        if (delta.content) {
+          yield { type: 'delta', content: delta.content };
+        }
+
+        // Tool call deltas (streamed incrementally)
+        if (delta.tool_calls) {
+          hasToolCalls = true;
+          for (const tc of delta.tool_calls) {
+            const idx = tc.index;
+            if (!toolCallAccum[idx]) {
+              toolCallAccum[idx] = {
+                id: tc.id || '',
+                type: tc.type || 'function',
+                function: { name: tc.function?.name || '', arguments: '' },
+              };
+            } else {
+              if (tc.id) toolCallAccum[idx].id = tc.id;
+              if (tc.function?.name) toolCallAccum[idx].function.name = tc.function.name;
+            }
+            if (tc.function?.arguments) {
+              toolCallAccum[idx].function.arguments += tc.function.arguments;
+            }
+          }
+        }
+
+        // Check finish_reason for tool_calls (some models emit this instead of [DONE])
+        const finishReason = parsed.choices?.[0]?.finish_reason;
+        if (finishReason === 'tool_calls' && hasToolCalls) {
+          yield {
+            type: 'tool_calls',
+            tool_calls: Object.values(toolCallAccum),
+          };
+          return;
+        }
+      } catch {
+        // Skip malformed JSON chunks
+      }
+    }
+  }
+}
+
 async function runDeepSeekDirect(
   model: string,
   prompt: string,
   groupFolder: string,
+  input?: HostAgentInput,
 ): Promise<HostAgentOutput> {
   const systemPrompt = getSystemPrompt(groupFolder, 'deepseek-direct');
   const userText = extractMessagesForLocal(prompt);
@@ -361,13 +471,13 @@ async function runDeepSeekDirect(
     history.shift();
   }
 
-  // Build messages with full type for tool call fields
   const messages: Array<Record<string, unknown>> = [
     { role: 'system', content: systemPrompt },
     ...history,
   ];
 
   const tools = getToolDefinitions();
+  const canStream = !!(input?.onStreamChunk);
 
   try {
     let finalResult = '';
@@ -376,13 +486,16 @@ async function runDeepSeekDirect(
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), AGENT_TIMEOUT);
 
+      // Tool rounds use non-streaming; final response streams if callback available
+      const isToolRound = round < MAX_TOOL_ROUNDS - 1;
+      const useStream = canStream; // stream all rounds, handle tool_calls from stream
+
       const body: Record<string, unknown> = {
         model,
         messages,
-        stream: false,
+        stream: useStream,
       };
 
-      // Only include tools on first rounds (not after all tools resolved)
       if (tools.length > 0) {
         body.tools = tools;
         body.tool_choice = 'auto';
@@ -405,75 +518,114 @@ async function runDeepSeekDirect(
         throw new Error(`DeepSeek API error ${response.status}: ${errorText}`);
       }
 
-      const data = (await response.json()) as {
-        choices?: Array<{
-          message?: {
-            role?: string;
-            content?: string | null;
-            tool_calls?: Array<{
-              id: string;
-              type: string;
-              function: { name: string; arguments: string };
-            }>;
-          };
-          finish_reason?: string;
-        }>;
-      };
+      if (useStream) {
+        // Streaming path
+        let streamedContent = '';
+        let toolCalls: Array<{
+          id: string;
+          type: string;
+          function: { name: string; arguments: string };
+        }> | null = null;
 
-      const choice = data.choices?.[0];
-      const msg = choice?.message;
-
-      if (!msg) throw new Error('No message in DeepSeek response');
-
-      // Check for tool calls
-      if (msg.tool_calls && msg.tool_calls.length > 0) {
-        // Append assistant message with tool_calls to messages
-        messages.push({
-          role: 'assistant',
-          content: msg.content || null,
-          tool_calls: msg.tool_calls,
-        });
-
-        // Execute each tool call
-        for (const tc of msg.tool_calls) {
-          const handler = getToolHandler(tc.function.name);
-          let toolResult: string;
-
-          if (!handler) {
-            toolResult = `Error: unknown tool "${tc.function.name}"`;
-          } else {
-            try {
-              const args = JSON.parse(tc.function.arguments);
-              logger.info(
-                { tool: tc.function.name, args, round },
-                'Executing tool call',
-              );
-              toolResult = await handler(args);
-            } catch (err) {
-              toolResult = `Tool error: ${err instanceof Error ? err.message : String(err)}`;
-            }
+        for await (const event of parseSSEStream(response)) {
+          if (event.type === 'delta' && event.content) {
+            streamedContent += event.content;
+            await input!.onStreamChunk!(event.content);
+          } else if (event.type === 'tool_calls') {
+            toolCalls = event.tool_calls || null;
           }
-
-          // Append tool result
-          messages.push({
-            role: 'tool',
-            tool_call_id: tc.id,
-            content: toolResult,
-          });
-
-          logger.info(
-            { tool: tc.function.name, resultLength: toolResult.length, round },
-            'Tool call completed',
-          );
         }
 
-        // Continue loop — send tool results back to LLM
-        continue;
-      }
+        if (toolCalls && toolCalls.length > 0) {
+          // Handle tool calls
+          messages.push({
+            role: 'assistant',
+            content: streamedContent || null,
+            tool_calls: toolCalls,
+          });
 
-      // No tool calls — final text response
-      finalResult = (msg.content || '').trim();
-      break;
+          for (const tc of toolCalls) {
+            const handler = getToolHandler(tc.function.name);
+            let toolResult: string;
+
+            if (!handler) {
+              toolResult = `Error: unknown tool "${tc.function.name}"`;
+            } else {
+              try {
+                const args = JSON.parse(tc.function.arguments);
+                logger.info({ tool: tc.function.name, args, round }, 'Executing tool call');
+                // Notify user about tool execution
+                if (input?.onStreamChunk) {
+                  await input.onStreamChunk(`\n⚙️ ${tc.function.name}...\n`);
+                }
+                toolResult = await handler(args);
+              } catch (err) {
+                toolResult = `Tool error: ${err instanceof Error ? err.message : String(err)}`;
+              }
+            }
+
+            messages.push({ role: 'tool', tool_call_id: tc.id, content: toolResult });
+            logger.info({ tool: tc.function.name, resultLength: toolResult.length, round }, 'Tool call completed');
+          }
+          continue;
+        }
+
+        // No tool calls — streaming text is the final result
+        finalResult = streamedContent.trim();
+        break;
+      } else {
+        // Non-streaming path (fallback)
+        const data = (await response.json()) as {
+          choices?: Array<{
+            message?: {
+              role?: string;
+              content?: string | null;
+              tool_calls?: Array<{
+                id: string;
+                type: string;
+                function: { name: string; arguments: string };
+              }>;
+            };
+            finish_reason?: string;
+          }>;
+        };
+
+        const choice = data.choices?.[0];
+        const msg = choice?.message;
+        if (!msg) throw new Error('No message in DeepSeek response');
+
+        if (msg.tool_calls && msg.tool_calls.length > 0) {
+          messages.push({
+            role: 'assistant',
+            content: msg.content || null,
+            tool_calls: msg.tool_calls,
+          });
+
+          for (const tc of msg.tool_calls) {
+            const handler = getToolHandler(tc.function.name);
+            let toolResult: string;
+
+            if (!handler) {
+              toolResult = `Error: unknown tool "${tc.function.name}"`;
+            } else {
+              try {
+                const args = JSON.parse(tc.function.arguments);
+                logger.info({ tool: tc.function.name, args, round }, 'Executing tool call');
+                toolResult = await handler(args);
+              } catch (err) {
+                toolResult = `Tool error: ${err instanceof Error ? err.message : String(err)}`;
+              }
+            }
+
+            messages.push({ role: 'tool', tool_call_id: tc.id, content: toolResult });
+            logger.info({ tool: tc.function.name, resultLength: toolResult.length, round }, 'Tool call completed');
+          }
+          continue;
+        }
+
+        finalResult = (msg.content || '').trim();
+        break;
+      }
     }
 
     history.push({ role: 'assistant', content: finalResult });
@@ -740,7 +892,7 @@ export async function runHostAgent(
   if (route.backend === 'local') {
     output = await runLocal(route.model, route.prompt, input.groupFolder);
   } else if (route.backend === 'deepseek-direct') {
-    output = await runDeepSeekDirect(route.model, route.prompt, input.groupFolder);
+    output = await runDeepSeekDirect(route.model, route.prompt, input.groupFolder, input);
   } else if (route.backend === 'gemini') {
     output = await runGemini(route.model, route.prompt, input.groupFolder);
   } else if (route.backend === 'openrouter') {

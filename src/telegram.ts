@@ -31,6 +31,10 @@ interface TelegramConfig {
     group: RegisteredGroup,
     prompt: string,
     chatJid: string,
+    streamCallbacks?: {
+      onStreamChunk: (chunk: string) => Promise<void>;
+      onStreamDone: () => Promise<string>;
+    },
   ) => Promise<string | null>;
   getRegisteredGroups: () => Record<string, RegisteredGroup>;
   getSessions: () => Record<string, string>;
@@ -147,9 +151,19 @@ export async function connectTelegram(
 
     await ctx.replyWithChatAction('typing');
 
-    const response = await config.runAgent(group, prompt, chatJid);
+    // Create streaming controller for this chat
+    const stream = createTelegramStream(msg.chat.id);
+    const streamCallbacks = {
+      onStreamChunk: (chunk: string) => stream.push(chunk),
+      onStreamDone: () => stream.finalize(),
+    };
+
+    const response = await config.runAgent(group, prompt, chatJid, streamCallbacks);
 
     if (response) {
+      // Finalize stream (flush remaining buffer)
+      await stream.finalize();
+
       config.lastAgentTimestamp[chatJid] = timestamp;
       config.saveState();
 
@@ -163,7 +177,10 @@ export async function connectTelegram(
         true,
       );
 
-      await sendTelegramMessage(msg.chat.id, response);
+      // If stream already sent the message, don't send again
+      if (!stream.getMessageId()) {
+        await sendTelegramMessage(msg.chat.id, response);
+      }
     }
   });
 
@@ -314,6 +331,95 @@ export async function sendTelegramMessage(
       logger.error({ chatId, err }, 'Failed to send Telegram message');
     }
   }
+}
+
+/**
+ * Stream a message to Telegram — send initial message then update it.
+ * Returns a controller for pushing chunks and finalizing.
+ */
+export function createTelegramStream(chatId: number) {
+  if (!bot) throw new Error('Telegram bot not initialized');
+
+  let messageId: number | null = null;
+  let buffer = '';
+  let lastEditTime = 0;
+  let editTimer: ReturnType<typeof setTimeout> | null = null;
+  const MIN_EDIT_INTERVAL = 1500; // Telegram rate limit ~1/sec, use 1.5s for safety
+  const botRef = bot;
+
+  async function flush() {
+    if (!messageId || !buffer) return;
+    const html = markdownToTelegramHtml(buffer);
+    try {
+      await botRef.api.editMessageText(chatId, messageId, html, { parse_mode: 'HTML' });
+      lastEditTime = Date.now();
+    } catch (err) {
+      // If HTML fails, try plain text
+      if (err instanceof GrammyError && err.error_code === 400) {
+        try {
+          await botRef.api.editMessageText(chatId, messageId, buffer);
+          lastEditTime = Date.now();
+        } catch {
+          // Ignore edit failures during streaming
+        }
+      }
+    }
+  }
+
+  return {
+    /** Push a text chunk. Will buffer and edit at rate-limited intervals. */
+    async push(chunk: string) {
+      buffer += chunk;
+
+      // First chunk: send initial message
+      if (!messageId) {
+        try {
+          const html = markdownToTelegramHtml(buffer);
+          const msg = await botRef.api.sendMessage(chatId, html, { parse_mode: 'HTML' });
+          messageId = msg.message_id;
+          lastEditTime = Date.now();
+        } catch {
+          const msg = await botRef.api.sendMessage(chatId, buffer);
+          messageId = msg.message_id;
+          lastEditTime = Date.now();
+        }
+        return;
+      }
+
+      // Rate-limited edit
+      const timeSinceLastEdit = Date.now() - lastEditTime;
+      if (timeSinceLastEdit >= MIN_EDIT_INTERVAL) {
+        if (editTimer) clearTimeout(editTimer);
+        await flush();
+      } else if (!editTimer) {
+        editTimer = setTimeout(async () => {
+          editTimer = null;
+          await flush();
+        }, MIN_EDIT_INTERVAL - timeSinceLastEdit);
+      }
+    },
+
+    /** Finalize: flush remaining buffer and return the full text. */
+    async finalize(): Promise<string> {
+      if (editTimer) {
+        clearTimeout(editTimer);
+        editTimer = null;
+      }
+      await flush();
+      logger.info({ chatId, length: buffer.length }, 'Telegram stream completed');
+      return buffer;
+    },
+
+    /** Get current buffer content */
+    getBuffer(): string {
+      return buffer;
+    },
+
+    /** Get the message ID (for storing in DB) */
+    getMessageId(): number | null {
+      return messageId;
+    },
+  };
 }
 
 export async function stopTelegram(): Promise<void> {
