@@ -920,9 +920,15 @@ async function runOpenCode(
   logger.info({ group: groupFolder }, 'Spawning OpenCode CLI');
 
   return new Promise((resolve) => {
-    const proc = spawn('opencode', ['run', userText, '--format', 'json'], {
+    const env = { ...process.env };
+    // Ensure homebrew bin is in PATH for opencode binary
+    if (!env.PATH?.includes('/opt/homebrew/bin')) {
+      env.PATH = `/opt/homebrew/bin:${env.PATH || ''}`;
+    }
+
+    const proc = spawn('opencode', ['run', userText, '--format', 'default'], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env },
+      env,
       cwd: path.join(GROUPS_DIR, groupFolder),
     });
 
