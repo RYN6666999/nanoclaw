@@ -911,6 +911,63 @@ async function runClaudeCli(
   });
 }
 
+async function runOpenCode(
+  prompt: string,
+  groupFolder: string,
+): Promise<HostAgentOutput> {
+  const userText = extractMessagesForLocal(prompt);
+
+  logger.info({ group: groupFolder }, 'Spawning OpenCode CLI');
+
+  return new Promise((resolve) => {
+    const proc = spawn('opencode', ['run', userText, '--format', 'json'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env },
+      cwd: path.join(GROUPS_DIR, groupFolder),
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      proc.kill('SIGTERM');
+      setTimeout(() => proc.kill('SIGKILL'), 5000);
+    }, AGENT_TIMEOUT);
+
+    proc.on('close', (code) => {
+      clearTimeout(timeout);
+
+      if (timedOut) {
+        resolve({ status: 'error', result: null, error: 'OpenCode CLI timed out' });
+        return;
+      }
+
+      if (code !== 0 && !stdout.trim()) {
+        resolve({ status: 'error', result: null, error: `OpenCode exited ${code}: ${stderr.slice(-200)}` });
+        return;
+      }
+
+      try {
+        const data = JSON.parse(stdout);
+        const result = data.result || data.output || data.text || stdout;
+        resolve({ status: 'success', result: typeof result === 'string' ? result : JSON.stringify(result) });
+      } catch {
+        resolve({ status: 'success', result: stdout.trim() || stderr.trim() || '(no output)' });
+      }
+    });
+
+    proc.on('error', (err) => {
+      clearTimeout(timeout);
+      resolve({ status: 'error', result: null, error: `OpenCode spawn error: ${err.message}` });
+    });
+  });
+}
+
 export async function runHostAgent(
   group: RegisteredGroup,
   input: HostAgentInput,
@@ -941,6 +998,8 @@ export async function runHostAgent(
     output = await runGemini(route.model, route.prompt, input.groupFolder);
   } else if (route.backend === 'openrouter') {
     output = await runOpenRouter(route.model, route.prompt, input.groupFolder);
+  } else if (route.backend === 'opencode') {
+    output = await runOpenCode(route.prompt, input.groupFolder);
   } else {
     output = await runClaudeCli(
       route.prompt,
