@@ -149,7 +149,15 @@ export async function connectTelegram(
       'Processing Telegram message',
     );
 
+    // Keep "typing..." indicator alive every 4s (TG auto-clears after 5s)
     await ctx.replyWithChatAction('typing');
+    const typingInterval = setInterval(async () => {
+      try {
+        await bot!.api.sendChatAction(msg.chat.id, 'typing');
+      } catch {
+        // Ignore — best effort
+      }
+    }, 4000);
 
     // Create streaming controller for this chat
     const stream = createTelegramStream(msg.chat.id);
@@ -159,6 +167,7 @@ export async function connectTelegram(
     };
 
     const response = await config.runAgent(group, prompt, chatJid, streamCallbacks);
+    clearInterval(typingInterval);
 
     if (response) {
       // Finalize stream (flush remaining buffer)
