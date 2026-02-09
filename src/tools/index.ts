@@ -8,6 +8,9 @@ import { readFile } from './read-file.js';
 import { writeFile } from './write-file.js';
 import { listFiles } from './list-files.js';
 import { obsidianNote } from './obsidian-note.js';
+import { tuneLocal } from './tune-local.js';
+import { editFile } from './edit-file.js';
+import { grepSearch } from './grep.js';
 
 export interface ToolDefinition {
   type: 'function';
@@ -34,6 +37,9 @@ const TOOLS: Tool[] = [
   writeFile,
   listFiles,
   obsidianNote,
+  tuneLocal,
+  editFile,
+  grepSearch,
 ];
 
 /** Tool definitions array for the API request */

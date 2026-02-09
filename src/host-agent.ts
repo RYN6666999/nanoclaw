@@ -76,6 +76,40 @@ function getSystemPrompt(groupFolder: string, backend?: string): string {
     prompt += '\n' + AGENT_SOUL_COMPACT;
   }
 
+  // Local model: inject tuned rules + few-shot examples
+  if (backend === 'local') {
+    // Local-specific rules (written by cloud model via tune_local tool)
+    const rulesPath = path.join(GROUPS_DIR, groupFolder, 'local-rules.md');
+    try {
+      const rules = fs.readFileSync(rulesPath, 'utf-8');
+      if (rules.trim()) {
+        prompt += '\n\n' + rules;
+      }
+    } catch {
+      // No local rules yet
+    }
+
+    // Few-shot examples (curated by cloud model)
+    const examplesPath = path.join(GROUPS_DIR, groupFolder, 'local-examples.json');
+    try {
+      const examples = JSON.parse(fs.readFileSync(examplesPath, 'utf-8')) as Array<{
+        question: string;
+        answer: string;
+        score: number;
+      }>;
+      // Inject top 5 highest-scored examples
+      const topExamples = examples.filter((e) => e.score >= 4).slice(0, 5);
+      if (topExamples.length > 0) {
+        prompt += '\n\n## Reference Examples\n';
+        for (const ex of topExamples) {
+          prompt += `\nQ: ${ex.question}\nA: ${ex.answer}\n`;
+        }
+      }
+    } catch {
+      // No examples yet
+    }
+  }
+
   // Append Obsidian context for memory continuity
   const obsidianContext = readObsidianContext();
   if (obsidianContext) {
