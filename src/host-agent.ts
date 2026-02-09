@@ -344,7 +344,7 @@ async function runOpenRouter(
   }
 }
 
-const MAX_TOOL_ROUNDS = 5; // prevent infinite tool call loops
+const MAX_TOOL_ROUNDS = 10; // tool call rounds (generous, most tasks use 1-3)
 
 /**
  * Parse SSE stream from DeepSeek API, yielding content deltas and tool calls.
@@ -625,6 +625,50 @@ async function runDeepSeekDirect(
 
         finalResult = (msg.content || '').trim();
         break;
+      }
+    }
+
+    // If loop exhausted all rounds on tool calls with no final text,
+    // make one more call WITHOUT tools to force a text response
+    if (!finalResult && messages.length > 2) {
+      logger.info({ model, group: groupFolder }, 'Tool rounds exhausted, forcing final response');
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), AGENT_TIMEOUT);
+
+      const finalBody: Record<string, unknown> = {
+        model,
+        messages,
+        stream: !!canStream,
+        // No tools — force text response
+      };
+
+      const finalResponse = await fetch(`${DEEPSEEK_API_BASE_URL}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
+        },
+        body: JSON.stringify(finalBody),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeout);
+
+      if (finalResponse.ok) {
+        if (canStream) {
+          for await (const event of parseSSEStream(finalResponse)) {
+            if (event.type === 'delta' && event.content) {
+              finalResult += event.content;
+              await input!.onStreamChunk!(event.content);
+            }
+          }
+          finalResult = finalResult.trim();
+        } else {
+          const data = (await finalResponse.json()) as {
+            choices?: Array<{ message?: { content?: string } }>;
+          };
+          finalResult = data.choices?.[0]?.message?.content?.trim() || '';
+        }
       }
     }
 
