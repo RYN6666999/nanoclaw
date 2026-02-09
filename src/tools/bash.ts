@@ -3,6 +3,7 @@
  */
 import { exec } from 'child_process';
 import type { Tool } from './index.js';
+import { isDangerousCommand } from './safety.js';
 
 const MAX_OUTPUT = 4000; // chars
 const TIMEOUT = 30000;   // 30s
@@ -11,10 +12,9 @@ async function handler(args: Record<string, unknown>): Promise<string> {
   const command = String(args.command || '');
   if (!command) return 'Error: command is required';
 
-  // Safety: block destructive commands
-  const blocked = ['rm -rf /', 'mkfs', 'dd if=', ':(){', 'fork bomb'];
-  for (const b of blocked) {
-    if (command.includes(b)) return `Error: command blocked for safety: ${b}`;
+  // Safety: block truly destructive commands
+  if (isDangerousCommand(command)) {
+    return `[BLOCKED] 此指令被判定為破壞性操作，已自動攔截：\n${command}\n\n請告知用戶手動執行此指令。`;
   }
 
   return new Promise((resolve) => {
