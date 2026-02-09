@@ -1,20 +1,28 @@
 /**
- * Safety — block truly destructive bash commands.
- * Philosophy: only block irreversible/catastrophic operations.
- * Normal dev operations (write, edit, kill, restart) are fine.
+ * Safety — only block operations that destroy SYSTEM files.
+ * Everything else is allowed: git push, kill, rm project files, etc.
+ * The ONLY red line: deleting/overwriting system paths.
  */
 
-const DANGEROUS_PATTERNS = [
-  /\brm\s+(-[^\s]*r|-[^\s]*f|--recursive)/,   // rm -r, rm -rf, rm -fr
-  /\brm\s+-[^\s]*\s+\//,                        // rm anything at root
-  /\b(reboot|shutdown|halt|poweroff)\b/,         // system shutdown
-  /\bgit\s+push\s+--force/,                      // force push
-  /\bgit\s+reset\s+--hard/,                      // hard reset
-  /\b(mkfs|fdisk|dd\s+if=)/,                     // disk operations
-  /\b(drop\s+table|truncate\s+table)/i,          // SQL destruction
-  /:()\s*\{/,                                     // fork bomb
+const SYSTEM_PATHS = [
+  '/usr', '/bin', '/sbin', '/etc', '/System', '/Library',
+  '/var', '/opt', '/boot', '/dev', '/proc', '/sys',
+];
+
+const SYSTEM_PATH_REGEX = new RegExp(
+  `\\brm\\s+[^|;]*(?:${SYSTEM_PATHS.map((p) => p.replace('/', '\\/')).join('|')})`,
+);
+
+// Fork bomb and disk format — always block
+const ALWAYS_BLOCK = [
+  /:()\s*\{/,                    // fork bomb
+  /\b(mkfs|fdisk)\b/,           // disk format
+  /\bdd\s+if=.*of=\/dev/,       // dd to device
 ];
 
 export function isDangerousCommand(command: string): boolean {
-  return DANGEROUS_PATTERNS.some((p) => p.test(command));
+  // Block: rm on system paths
+  if (SYSTEM_PATH_REGEX.test(command)) return true;
+  // Block: fork bomb, disk format
+  return ALWAYS_BLOCK.some((p) => p.test(command));
 }
