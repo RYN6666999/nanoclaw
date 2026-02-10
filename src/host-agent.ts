@@ -256,7 +256,7 @@ async function runOpenRouter(
   const canStream = !!(input?.onStreamChunk);
 
   // Models known to NOT support function calling
-  const NO_TOOLS_MODELS = ['x-ai/grok', 'mistral', 'llama'];
+  const NO_TOOLS_MODELS = ['x-ai/grok', 'mistral', 'llama', 'deepseek'];
   const supportsTools = !NO_TOOLS_MODELS.some(prefix => model.includes(prefix));
 
   try {

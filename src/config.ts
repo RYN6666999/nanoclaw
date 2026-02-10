@@ -49,7 +49,8 @@ export const IPC_POLL_INTERVAL = 1000;
 
 // Obsidian memory integration (defined early so router config can use it)
 export const OBSIDIAN_VAULT_PATH =
-  process.env.OBSIDIAN_VAULT_PATH || path.join(HOME_DIR, 'Obsidian', 'Vault');
+  process.env.OBSIDIAN_VAULT_PATH ||
+  path.join(HOME_DIR, 'Library', 'Mobile Documents', 'iCloud~md~obsidian', 'Documents', 'Fun');
 export const OBSIDIAN_MEMORY_DIR = path.join(
   OBSIDIAN_VAULT_PATH,
   'Nano_Memories',

@@ -12,6 +12,7 @@ import {
   storeTelegramMessage,
 } from './db.js';
 import { logger } from './logger.js';
+import { getToolHandler } from './tools/index.js';
 import { RegisteredGroup } from './types.js';
 
 const TG_JID_PREFIX = 'tg:';
@@ -228,6 +229,35 @@ export async function connectTelegram(
       const triggerMatch = msg.text.includes(group.trigger) ||
         msg.text.startsWith('/');  // slash commands always pass
       if (!triggerMatch) return;
+    }
+
+    // /draw command — bypass model, call generate_image directly
+    if (msg.text.startsWith('/draw ') || msg.text.startsWith('/draw\n')) {
+      const drawPrompt = msg.text.slice(5).trim();
+      if (!drawPrompt) {
+        await sendTelegramMessage(msg.chat.id, '用法: /draw <英文描述>');
+        return;
+      }
+      await ctx.replyWithChatAction('typing');
+      const typingInt = setInterval(async () => {
+        try { await bot!.api.sendChatAction(msg.chat.id, 'typing'); } catch { /* */ }
+      }, 4000);
+
+      try {
+        const handler = getToolHandler('generate_image');
+        if (!handler) throw new Error('generate_image tool not found');
+        const result = await handler({ prompt: drawPrompt });
+        logger.info({ drawPrompt, resultLength: result.length }, '/draw command executed');
+
+        storeTelegramMessage(`bot-${Date.now()}`, chatJid, 'bot', ASSISTANT_NAME, result, new Date().toISOString(), true);
+        await sendTelegramMessage(msg.chat.id, result);
+      } catch (err) {
+        const errMsg = `生圖失敗: ${err instanceof Error ? err.message : String(err)}`;
+        await sendTelegramMessage(msg.chat.id, errMsg);
+      } finally {
+        clearInterval(typingInt);
+      }
+      return;
     }
 
     // Build context from missed messages
