@@ -1,12 +1,12 @@
 /**
  * Model Router for NanoClaw
- * Routes: local (free) → gemini (long docs) → openrouter (complex) → claude (tools)
- * Keywords and backend toggles read from Obsidian router-config.json
+ * Routes: grok-3-mini (default) -> lumimaid-70b (deep RP) -> gemini (long docs) -> grok-2 (/x search)
+ * SeMeow架構：3-Mini日常+prompt優化 / Lumimaid深度RP / Gemini Vision
  */
 import {
   DEFAULT_LOCAL_MODEL,
-  DEEPSEEK_API_KEY,
-  DEEPSEEK_MODEL,
+  // DEEPSEEK_API_KEY,
+  // DEEPSEEK_MODEL,
   GEMINI_API_KEY,
   GEMINI_AUTO_THRESHOLD,
   GEMINI_MODEL,
@@ -15,74 +15,121 @@ import {
   ROUTER_CONFIG,
 } from './config.js';
 
-export type Backend = 'local' | 'gemini' | 'openrouter' | 'deepseek-direct' | 'claude' | 'opencode';
+export type Backend = 'openrouter' | 'gemini' | 'claude' | 'opencode';
 
-export type RouteReason = 'prefix' | 'search' | 'complex' | 'long-doc' | 'default' | 'scheduled' | 'fallback';
+export type RouteReason =
+  | 'prefix'
+  | 'search'
+  | 'complex'
+  | 'long-doc'
+  | 'nsfw-rp'
+  | 'default'
+  | 'scheduled'
+  | 'fallback';
 
 export interface RouteResult {
   backend: Backend;
   model: string;
   prompt: string;
   reason: RouteReason;
-  /** The original prefix command if reason=prefix, e.g. "/deepseek" */
   prefix?: string;
 }
 
+// 赫密士模型常數
+const GLM_FLASH = 'z-ai/glm-4.7-flash';       // 預設：$0.06/1M，202K ctx
+// 瑟喵模型常數
+const GROK_MINI = 'x-ai/grok-3-mini';          // 瑟喵日常：$0.30/1M，131K ctx
+const EURYALE = 'sao10k/l3.3-euryale-70b';     // 深度RP：$0.65/1M，131K ctx
+const GROK_2 = 'x-ai/grok-2-1212';
+
 const PREFIX_MAP: Record<string, { backend: Backend; model: string }> = {
   '/claude': { backend: 'claude', model: 'claude' },
-  '/deepseek': { backend: 'deepseek-direct', model: DEEPSEEK_MODEL },
   '/openrouter': { backend: 'openrouter', model: OPENROUTER_MODEL },
   '/gemini': { backend: 'gemini', model: GEMINI_MODEL },
-  '/x': { backend: 'openrouter', model: 'x-ai/grok-4.1-fast' },
-  '/local': { backend: 'local', model: DEFAULT_LOCAL_MODEL },
+  '/x': { backend: 'openrouter', model: GROK_2 },
   '/code': { backend: 'opencode', model: 'opencode' },
+  '/rp': { backend: 'openrouter', model: EURYALE }, // 強制深度RP
+  '/mini': { backend: 'openrouter', model: GROK_MINI }, // 強制Grok Mini
 };
 
 const COMPLEX_KEYWORDS = ROUTER_CONFIG?.complex_keywords || [
-  'refactor', 'debug', 'architecture', 'algorithm',
-  'optimize', 'performance', 'implement', 'complex', 'sophisticated',
+  'refactor',
+  'debug',
+  'architecture',
+  'algorithm',
+  'optimize',
+  'performance',
+  'implement',
+  'complex',
+  'sophisticated',
 ];
 
-const SEARCH_KEYWORDS = ROUTER_CONFIG?.search_keywords || [
-  'search', 'find', 'look up', 'what is', 'who is',
-  'latest', 'recent', 'news', 'current', 'trending',
-  'how to', 'where', 'when', 'research',
+// 深度RP關鍵字 → Lumimaid 70B（情感流暢度特化）
+const DEEP_RP_KEYWORDS = [
+  // 中文觸發
+  '入戲',
+  '角色扮演',
+  '扮演',
+  '情境',
+  '場景',
+  '帶我',
+  '帶領我',
+  '繼續',
+  '繼續演',
+  '撫摸',
+  '喘息',
+  '低語',
+  '呻吟',
+  '親吻',
+  '緊緊',
+  '靠近',
+  '感受',
+  '體溫',
+  '主人想要',
+  '主人需要',
+  '把我',
+  '讓我感覺',
+  // 英文觸發
+  'roleplay',
+  'in character',
+  'stay in character',
+  'act as',
+  'pretend',
+  'touch me',
+  'kiss',
+  'whisper',
+  'moan',
+  'embrace',
 ];
 
 function isBackendEnabled(backend: Backend): boolean {
   if (!ROUTER_CONFIG) return true;
-  const cfg = ROUTER_CONFIG.backends?.[backend];
+  const cfg = ROUTER_CONFIG.backends?.[backend as string];
   return cfg ? cfg.enabled !== false : true;
 }
 
-function isComplexTask(text: string): boolean {
+function matchesKeywords(text: string, keywords: string[]): boolean {
   const lower = text.toLowerCase();
-  return COMPLEX_KEYWORDS.some((kw) => lower.includes(kw));
+  return keywords.some((kw) => lower.includes(kw));
 }
 
-function needsSearch(text: string): boolean {
-  const lower = text.toLowerCase();
-  return SEARCH_KEYWORDS.some((kw) => lower.includes(kw));
-}
-
-/**
- * Route a message to the appropriate backend.
- * Priority: /prefix commands → long documents (Gemini) → complexity (OpenRouter) → local (free)
- */
 export function routeMessage(
   rawPrompt: string,
   isScheduledTask: boolean,
 ): RouteResult {
-  // Scheduled tasks always use Claude CLI (they need tools)
-  if (isScheduledTask) {
-    return { backend: 'claude', model: 'claude', prompt: rawPrompt, reason: 'scheduled' };
-  }
-
-  // Check prefix commands (highest priority)
+  if (isScheduledTask)
+    return {
+      backend: 'claude',
+      model: 'claude',
+      prompt: rawPrompt,
+      reason: 'scheduled',
+    };
   const lastMessageText = extractLastMessageText(rawPrompt);
-
   for (const [prefix, route] of Object.entries(PREFIX_MAP)) {
-    if (lastMessageText.startsWith(prefix + ' ') || lastMessageText === prefix) {
+    if (
+      lastMessageText.startsWith(prefix + ' ') ||
+      lastMessageText === prefix
+    ) {
       if (!isBackendEnabled(route.backend)) continue;
       const stripped = lastMessageText.startsWith(prefix + ' ')
         ? lastMessageText.slice(prefix.length + 1)
@@ -90,22 +137,23 @@ export function routeMessage(
       const prompt = stripped
         ? rawPrompt.replace(lastMessageText, stripped)
         : rawPrompt;
-      return { backend: route.backend, model: route.model, prompt, reason: 'prefix', prefix };
+      return {
+        backend: route.backend,
+        model: route.model,
+        prompt,
+        reason: 'prefix',
+        prefix,
+      };
     }
   }
 
-  // Auto-detect search needs → use DeepSeek direct
-  if (DEEPSEEK_API_KEY && needsSearch(lastMessageText)) {
-    return {
-      backend: 'deepseek-direct',
-      model: DEEPSEEK_MODEL,
-      prompt: rawPrompt,
-      reason: 'search',
-    };
-  }
-
-  // Auto-detect long documents → use Gemini (100K+ token context window)
-  if (GEMINI_API_KEY && isBackendEnabled('gemini') && rawPrompt.length > GEMINI_AUTO_THRESHOLD) {
+  // 長文 → Gemini（1M context，最適合）
+  if (
+    GEMINI_API_KEY &&
+    isBackendEnabled('gemini') &&
+    rawPrompt.length >
+      (ROUTER_CONFIG?.backends?.gemini?.auto_threshold || 50000)
+  ) {
     return {
       backend: 'gemini',
       model: GEMINI_MODEL,
@@ -114,100 +162,84 @@ export function routeMessage(
     };
   }
 
-  // Auto-detect complex tasks → use DeepSeek direct
-  if (DEEPSEEK_API_KEY && isComplexTask(lastMessageText)) {
+  // 深度RP關鍵字 → Euryale v3（RP專職，131K context）
+  if (
+    OPENROUTER_API_KEY &&
+    matchesKeywords(lastMessageText, DEEP_RP_KEYWORDS)
+  ) {
     return {
-      backend: 'deepseek-direct',
-      model: DEEPSEEK_MODEL,
+      backend: 'openrouter',
+      model: EURYALE,
       prompt: rawPrompt,
-      reason: 'complex',
+      reason: 'nsfw-rp',
     };
   }
 
-  // Default: DeepSeek direct (cheapest capable model)
-  if (DEEPSEEK_API_KEY) {
-    return {
-      backend: 'deepseek-direct',
-      model: DEEPSEEK_MODEL,
-      prompt: rawPrompt,
-      reason: 'default',
-    };
-  }
-
-  // Fallback: local LLM (free, zero cost)
+  // 赫密士預設 → GLM-4.7-Flash（$0.06，成本優先）
+  // 瑟喵預設 → Grok 3-Mini（模擬人設，日常對話）
+  const isHermes = (process.env.ASSISTANT_NAME || '').includes('赫');
   return {
-    backend: 'local',
-    model: DEFAULT_LOCAL_MODEL,
+    backend: 'openrouter',
+    model: isHermes ? GLM_FLASH : GROK_MINI,
     prompt: rawPrompt,
     reason: 'default',
   };
 }
 
 const REASON_LABELS: Record<RouteReason, string> = {
-  prefix: '',       // will use prefix field instead
+  prefix: '',
   search: '搜尋',
   complex: '複雜',
   'long-doc': '長文',
+  'nsfw-rp': '情感',
   default: '預設',
   scheduled: '排程',
   fallback: '降級',
 };
-
-/**
- * Fallback chain: when a backend fails, try the next one.
- * Order: deepseek-direct → openrouter → gemini → local
- */
 const FALLBACK_CHAIN: Array<{ backend: Backend; model: string }> = [
-  { backend: 'deepseek-direct', model: 'deepseek-chat' },
-  { backend: 'openrouter', model: 'deepseek/deepseek-chat' },
+  {
+    backend: 'openrouter',
+    model: 'google/gemini-2.0-flash-lite-preview-02-05:free',
+  },
+  { backend: 'openrouter', model: 'opencode/glm-5-free' },
+  // { backend: "openrouter", model: "deepseek/deepseek-chat" },
   { backend: 'gemini', model: 'gemini-2.0-flash' },
-  { backend: 'local', model: 'llama-3.2-3b-instruct' },
 ];
 
-/**
- * Check if a backend has the required API key configured.
- */
 function hasApiKey(backend: Backend): boolean {
   switch (backend) {
-    case 'deepseek-direct': return !!DEEPSEEK_API_KEY;
-    case 'openrouter': return !!OPENROUTER_API_KEY;
-    case 'gemini': return !!GEMINI_API_KEY;
-    case 'local': return true; // no key needed
-    case 'claude': return true; // uses CLI auth
-    default: return false;
+    case 'openrouter':
+      return !!OPENROUTER_API_KEY;
+    case 'gemini':
+      return !!GEMINI_API_KEY;
+    case 'claude':
+      return true;
+    default:
+      return false;
   }
 }
 
-/**
- * Get fallback backends to try after the primary fails.
- * Excludes the failed backend and checks both enabled status AND API key availability.
- */
-export function getFallbackChain(failedBackend: Backend): Array<{ backend: Backend; model: string }> {
-  return FALLBACK_CHAIN.filter((f) =>
-    f.backend !== failedBackend &&
-    isBackendEnabled(f.backend) &&
-    hasApiKey(f.backend),
+export function getFallbackChain(
+  failedBackend: Backend,
+): Array<{ backend: Backend; model: string }> {
+  return FALLBACK_CHAIN.filter(
+    (f) =>
+      f.backend !== failedBackend &&
+      isBackendEnabled(f.backend) &&
+      hasApiKey(f.backend),
   );
 }
 
-/**
- * Format route signature for display, e.g. "[/deepseek → deepseek-chat]"
- */
 export function formatRouteSignature(route: RouteResult): string {
-  const label = route.reason === 'prefix' && route.prefix
-    ? route.prefix
-    : REASON_LABELS[route.reason];
+  const label =
+    route.reason === 'prefix' && route.prefix
+      ? route.prefix
+      : REASON_LABELS[route.reason];
   return `[${label} → ${route.model}]`;
 }
 
-/**
- * Extract the text content from the last <message> in the XML prompt.
- */
 function extractLastMessageText(prompt: string): string {
   const matches = [...prompt.matchAll(/<message[^>]*>([\s\S]*?)<\/message>/g)];
-  if (matches.length > 0) {
-    const lastContent = matches[matches.length - 1][1];
-    return lastContent.trim();
-  }
+  if (matches.length > 0) return matches[matches.length - 1][1].trim();
   return prompt.trim();
 }

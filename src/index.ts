@@ -7,10 +7,13 @@ import {
   IPC_POLL_INTERVAL,
   MAIN_GROUP_FOLDER,
   TIMEZONE,
+  STORE_DIR,
+  GROUPS_DIR,
 } from './config.js';
 import { ensureBackendsAvailable, runHostAgent } from './host-agent.js';
 import { initDatabase } from './db.js';
 import { startSchedulerLoop } from './task-scheduler.js';
+import { startHeartbeat, heartbeatRecordConversation } from './heartbeat.js';
 import { RegisteredGroup, Session } from './types.js';
 import { loadJson, saveJson } from './utils.js';
 import { logger } from './logger.js';
@@ -20,6 +23,7 @@ import {
   isTelegramJid,
   sendTelegramMessage,
 } from './telegram.js';
+import { startHealthMonitor } from './health-monitor.js';
 
 let sessions: Session = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
@@ -55,7 +59,7 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   saveJson(path.join(DATA_DIR, 'registered_groups.json'), registeredGroups);
 
   // Create group folder
-  const groupDir = path.join(DATA_DIR, '..', 'groups', group.folder);
+  const groupDir = path.join(GROUPS_DIR, group.folder);
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
 
   logger.info(
@@ -72,8 +76,7 @@ async function runAgent(
     onStreamChunk: (chunk: string) => Promise<void>;
     onStreamDone: () => Promise<string>;
   },
-  imageBase64?: string,
-  imageMimeType?: string,
+  imageData?: { imageBase64: string; imageMimeType: string },
 ): Promise<string | null> {
   const isMain = group.folder === MAIN_GROUP_FOLDER;
   const sessionId = sessions[group.folder];
@@ -87,8 +90,8 @@ async function runAgent(
       isMain,
       onStreamChunk: streamCallbacks?.onStreamChunk,
       onStreamDone: streamCallbacks?.onStreamDone,
-      imageBase64,
-      imageMimeType,
+      imageBase64: imageData?.imageBase64,
+      imageMimeType: imageData?.imageMimeType,
     });
 
     if (output.newSessionId) {
@@ -97,13 +100,11 @@ async function runAgent(
     }
 
     if (output.status === 'error') {
-      logger.error(
-        { group: group.name, error: output.error },
-        'Agent error',
-      );
+      logger.error({ group: group.name, error: output.error }, 'Agent error');
       return null;
     }
 
+    heartbeatRecordConversation(group.folder);
     return output.result;
   } catch (err) {
     logger.error({ group: group.name, err }, 'Agent error');
@@ -168,10 +169,7 @@ function startIpcWatcher(): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await sendMessage(
-                    data.chatJid,
-                    data.text,
-                  );
+                  await sendMessage(data.chatJid, data.text);
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup },
                     'IPC message sent',
@@ -452,15 +450,27 @@ async function main(): Promise<void> {
 
   await ensureBackendsAvailable();
   initDatabase();
-  logger.info('Database initialized');
+  startHeartbeat();
+  logger.info(
+    {
+      envFile: process.env.ENV_FILE || '.env',
+      assistant: ASSISTANT_NAME,
+      dataDir: DATA_DIR,
+      storeDir: STORE_DIR,
+    },
+    'Database initialized and configuration loaded',
+  );
   loadState();
 
   // Auto-register Telegram main group if not already registered
+  fs.mkdirSync(GROUPS_DIR, { recursive: true });
   const mainJidExists = Object.values(registeredGroups).some(
     (g) => g.folder === MAIN_GROUP_FOLDER,
   );
   if (!mainJidExists) {
-    logger.info('No main group registered yet — will auto-register on first Telegram message');
+    logger.info(
+      'No main group registered yet — will auto-register on first Telegram message',
+    );
   }
 
   await connectTelegram(telegramToken, {
@@ -480,6 +490,22 @@ async function main(): Promise<void> {
     getSessions: () => sessions,
   });
   startIpcWatcher();
+
+  // Start health monitor after bot is connected
+  const bot = (global as any).__nanoclaw_bot;
+  if (bot) {
+    startHealthMonitor(bot);
+  }
+
+  // Periodic metrics logging (every hour)
+  setInterval(
+    () => {
+      import('./observability.js').then((mod) => {
+        mod.Observability.logPeriodicMetrics();
+      });
+    },
+    1000 * 60 * 60,
+  );
 
   logger.info('NanoClaw running (Telegram mode)');
 }

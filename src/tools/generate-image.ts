@@ -48,14 +48,14 @@ async function tryDrawThings(
   seed: number,
   outputPath: string,
 ): Promise<string | null> {
-  // Check if Draw Things API is running
-  const healthCheck = await fetch(`${DRAW_THINGS_URL}/sdapi/v1/options`, {
-    signal: AbortSignal.timeout(2000),
+  // Check if Draw Things API is running (root endpoint always responds)
+  const healthCheck = await fetch(`${DRAW_THINGS_URL}/`, {
+    signal: AbortSignal.timeout(3000),
   }).catch(() => null);
 
   if (!healthCheck?.ok) return null;
 
-  // Use Automatic1111-compatible API (Draw Things supports this)
+  // Draw Things API (A1111-compatible txt2img)
   const response = await fetch(`${DRAW_THINGS_URL}/sdapi/v1/txt2img`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -64,8 +64,15 @@ async function tryDrawThings(
       width,
       height,
       seed,
-      steps: 20,
+      steps: 28,
       cfg_scale: 7,
+      sampler_name: 'DPM++ 2M Karras',
+      loras: [],
+      controls: [],
+      model: 'realistic_vision_v6.0_f16.ckpt',
+      override_settings: {
+        sd_model_checkpoint: 'realistic_vision_v6.0_f16.ckpt',
+      },
     }),
     signal: AbortSignal.timeout(TIMEOUT),
   });

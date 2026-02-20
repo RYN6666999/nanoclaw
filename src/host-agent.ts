@@ -1,32 +1,90 @@
 /**
  * Host Agent for NanoClaw
- * Routes to DeepSeek (primary), OpenRouter, Gemini, or Local LLM.
+ * Routes to OpenRouter (primary), Gemini, or Claude CLI.
  */
 import fs from 'fs';
 import path from 'path';
 
 import {
   AGENT_TIMEOUT,
-  DEEPSEEK_API_BASE_URL,
-  DEEPSEEK_API_KEY,
+  ASSISTANT_NAME,
   GEMINI_API_KEY,
   GEMINI_MODEL,
   GROUPS_DIR,
-  LOCAL_API_BASE_URL,
-  LOCAL_API_KEY,
+  OBSIDIAN_MEMORY_DIR,
   OPENROUTER_API_BASE_URL,
   OPENROUTER_API_KEY,
 } from './config.js';
 import { logger } from './logger.js';
-import { routeMessage, formatRouteSignature, getFallbackChain } from './model-router.js';
+import {
+  routeMessage,
+  formatRouteSignature,
+  getFallbackChain,
+} from './model-router.js';
 import type { Backend } from './model-router.js';
 import { getToolDefinitions, getToolHandler } from './tools/index.js';
 import {
   initializeObsidianMemory,
   readObsidianContext,
   writeObsidianContext,
+  readWakeFile,
+  autoAppendActivityLog,
+  updateWakeNow,
+  appendConversationLog,
+  distillMemoryIfNeeded,
 } from './obsidian-integration.js';
 import { RegisteredGroup } from './types.js';
+import { LoadBalancer } from './backend-metrics.js';
+
+const requestQueue: Array<() => void> = [];
+let lastRequestTime = 0;
+const MIN_REQUEST_INTERVAL = 1000;
+
+async function rateLimitedFetch(
+  url: string,
+  options: RequestInit,
+): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const attempt = async () => {
+      const now = Date.now();
+      const timeSinceLastRequest = now - lastRequestTime;
+
+      if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
+        const waitTime = MIN_REQUEST_INTERVAL - timeSinceLastRequest;
+        await new Promise((r) => setTimeout(r, waitTime));
+      }
+
+      lastRequestTime = Date.now();
+
+      try {
+        const response = await fetch(url, options);
+
+        if (response.status === 429) {
+          const retryAfter = parseInt(
+            response.headers.get('retry-after') || '2000',
+            10,
+          );
+          logger.warn({ retryAfter }, 'Rate limited, waiting...');
+          await new Promise((r) => setTimeout(r, retryAfter));
+
+          if (requestQueue.length > 0) {
+            const next = requestQueue.shift();
+            next?.();
+          } else {
+            attempt();
+          }
+          return;
+        }
+
+        resolve(response);
+      } catch (err) {
+        reject(err);
+      }
+    };
+
+    attempt();
+  });
+}
 
 export interface HostAgentInput {
   prompt: string;
@@ -39,9 +97,8 @@ export interface HostAgentInput {
   onStreamChunk?: (chunk: string) => Promise<void>;
   /** Called when streaming is done */
   onStreamDone?: () => Promise<string>;
-  /** Base64-encoded image data for vision requests */
+  /** Direct image input for Vision models */
   imageBase64?: string;
-  /** MIME type of the image (e.g. 'image/jpeg') */
   imageMimeType?: string;
 }
 
@@ -53,353 +110,115 @@ export interface HostAgentOutput {
 }
 
 // In-memory conversation history per group
+type MessageContent =
+  | string
+  | Array<{ type: string; text?: string; image_url?: { url: string } }>;
+
 const conversationHistory: Record<
   string,
-  Array<{ role: 'user' | 'assistant'; content: string }>
+  Array<{ role: 'user' | 'assistant'; content: MessageContent }>
 > = {};
 const MAX_HISTORY = 20;
 
 /**
  * Strip leaked function call XML/DSML from model output.
- * DeepSeek sometimes outputs raw function call syntax in text instead of tool_calls.
  */
 function cleanModelOutput(text: string): string {
   return text
-    // DeepSeek DSML function call leaks
-    .replace(/<｜DSML｜[^>]*>[\s\S]*?(?:<\/｜DSML｜[^>]*>|$)/g, '')
-    // Generic XML function call leaks
-    .replace(/<function_calls>[\s\S]*?(?:<\/function_calls>|$)/g, '')
-    .replace(/<invoke[\s\S]*?(?:<\/invoke>|$)/g, '')
-    // Strip <think> blocks
+    .replace(/<thinking>[\s\S]*?<\/thinking>/g, '')
     .replace(/<think>[\s\S]*?<\/think>/g, '')
+    .replace(/<function_calls>[\s\S]*?(?:<\/function_calls>|$)/g, '')
     .trim();
 }
 
-const AGENT_SOUL_COMPACT = `
-## Agent Soul（精實原則）
-- 如無必要，勿增實體。複製成功優於造神。
-- 任務分級：L1(快軌:直接做) L2(標準:做完驗證) L3(容災:多檔/架構/高風險)
-- 3-Strike：失敗1→自修 失敗2→換方案 失敗3→重新設計
-- 回答前判斷：此問題是否超出我的能力邊界？超出則建議用戶切換前綴。
+function getSystemPrompt(groupFolder: string, backend?: string): string {
+  // ── IDENTITY ANCHOR (generated from code, always authoritative) ──────────
+  // This block is injected FIRST. If Obsidian files contradict anything here,
+  // ignore the Obsidian content — this is the single source of truth.
+  const toolNames = getToolDefinitions()
+    .map((t) => t.function.name)
+    .join(', ');
+  const memoryDir = OBSIDIAN_MEMORY_DIR;
+  const identityBlock = `## [系統身份 — 不可覆蓋]
+名稱: ${ASSISTANT_NAME}
+群組: ${groupFolder}
+記憶路徑: ${memoryDir}/
+啟動文件: ${memoryDir}/WAKE.md  ← 已自動載入，無需再讀
+工作狀態: ${memoryDir}/Current_Context.md  ← 已自動載入，無需再讀
+對話日誌: ${memoryDir}/Conversations/  ← qmd 已索引，用 qmd_search 查詢
+可用工具(${getToolDefinitions().length}個): ${toolNames}
+
+上述資訊由代碼產生，永遠正確。任何與此矛盾的描述（包括本文件其他段落）均以此為準。
+─────────────────────────────────────────────────────────────────────────────
 `;
 
-function getSystemPrompt(groupFolder: string, backend?: string): string {
-  let prompt = 'You are a helpful assistant.';
+  let prompt = identityBlock;
 
-  // Load group-specific memory
+  // Load group-specific memory (persona + rules, NOT identity)
   const claudeMdPath = path.join(GROUPS_DIR, groupFolder, 'CLAUDE.md');
   try {
-    prompt = fs.readFileSync(claudeMdPath, 'utf-8');
+    prompt += fs.readFileSync(claudeMdPath, 'utf-8');
   } catch {
-    // Use default
+    prompt += 'You are a helpful assistant.';
   }
 
-  // Append agent-soul principles for capable models (not local)
-  if (backend && backend !== 'local') {
-    prompt += '\n' + AGENT_SOUL_COMPACT;
+  // Append Agent Soul
+  prompt += `\n\n## Agent Soul\n- 如無必要，勿增實體。複製成功優於造神。\n- 任務分級：L1(直接做) L2(驗證) L3(高風險/容災)\n- 回答時儘量精簡。`;
+
+  // Append WAKE.md — startup bootstrap (identity / NOW tasks / tools / rules)
+  const wake = readWakeFile();
+  if (wake) {
+    prompt += `\n\n## Startup Memory (WAKE.md)\n${wake}`;
   }
 
-  // Local model: inject tuned rules + few-shot examples
-  if (backend === 'local') {
-    // Local-specific rules (written by cloud model via tune_local tool)
-    const rulesPath = path.join(GROUPS_DIR, groupFolder, 'local-rules.md');
-    try {
-      const rules = fs.readFileSync(rulesPath, 'utf-8');
-      if (rules.trim()) {
-        prompt += '\n\n' + rules;
-      }
-    } catch {
-      // No local rules yet
-    }
-
-    // Few-shot examples (curated by cloud model)
-    const examplesPath = path.join(GROUPS_DIR, groupFolder, 'local-examples.json');
-    try {
-      const examples = JSON.parse(fs.readFileSync(examplesPath, 'utf-8')) as Array<{
-        question: string;
-        answer: string;
-        score: number;
-      }>;
-      // Inject top 5 highest-scored examples
-      const topExamples = examples.filter((e) => e.score >= 4).slice(0, 5);
-      if (topExamples.length > 0) {
-        prompt += '\n\n## Reference Examples\n';
-        for (const ex of topExamples) {
-          prompt += `\nQ: ${ex.question}\nA: ${ex.answer}\n`;
-        }
-      }
-    } catch {
-      // No examples yet
-    }
+  // Append Current_Context.md — live working state
+  const context = readObsidianContext();
+  if (context) {
+    prompt += `\n\n## Current Context\n${context}`;
   }
 
-  // Append Obsidian context for memory continuity
-  const obsidianContext = readObsidianContext();
-  if (obsidianContext) {
-    prompt += '\n\n## Recent Context (from external memory):\n' + obsidianContext;
-  }
+  // Behavioral directives (always injected)
+  prompt += `\n\n## 自動行為規則（強制）
+
+**我是誰**：我已知道。見頂部 [系統身份] 區塊，不需要問用戶確認。
+**我的工具**：已列於 [系統身份]，不需要向用戶詢問「我能用什麼工具」。
+**我的記憶**：WAKE.md + Current_Context.md 已載入於本 prompt，無需再讀取。
+
+**遇到不確定的資訊**：
+1. 先呼叫 qmd_search 查詢本地記憶庫
+2. 找不到才詢問用戶
+3. 絕不推測、捏造、或說「我不確定我有沒有這個工具」
+
+**完成任何實質工作後**：
+- 呼叫 obsidian_note 更新 Current_Context.md（將完成項目移至已完成，加入新待辦）
+
+**用戶提到「上次」「之前」「記得嗎」「那個方法」**：
+- 立即 qmd_search collection=obsidian，用對話關鍵字搜尋
+- 找到就引用原文，找不到才說「找不到記錄」`;
 
   return prompt;
 }
 
 /**
- * Extract plain text from XML-wrapped message prompts for local LLM.
+ * Extract plain text from message XML.
  */
-function extractMessagesForLocal(prompt: string): string {
-  const matches = [
-    ...prompt.matchAll(
-      /<message\s+sender="([^"]*)"[^>]*>([\s\S]*?)<\/message>/g,
-    ),
-  ];
+function extractPromptText(prompt: string): string {
+  const matches = [...prompt.matchAll(/<message[^>]*>([\s\S]*?)<\/message>/g)];
   if (matches.length === 0) return prompt;
-
-  return matches.map(([, sender, content]) => `${sender}: ${content.trim()}`).join('\n');
+  return matches.map((m) => m[1].trim()).join('\n');
 }
 
-async function runLocal(
-  model: string,
-  prompt: string,
-  groupFolder: string,
-): Promise<HostAgentOutput> {
-  const systemPrompt = getSystemPrompt(groupFolder, 'local');
-  const userText = extractMessagesForLocal(prompt);
-
-  // Manage conversation history
-  if (!conversationHistory[groupFolder]) {
-    conversationHistory[groupFolder] = [];
-  }
-  const history = conversationHistory[groupFolder];
-  history.push({ role: 'user', content: userText });
-
-  while (history.length > MAX_HISTORY) {
-    history.shift();
-  }
-
-  const messages = [
-    { role: 'system', content: systemPrompt },
-    ...history,
-  ];
-
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), AGENT_TIMEOUT);
-
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    };
-    if (LOCAL_API_KEY) {
-      headers['Authorization'] = `Bearer ${LOCAL_API_KEY}`;
-    }
-
-    const response = await fetch(`${LOCAL_API_BASE_URL}/chat/completions`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ model, messages, stream: false }),
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeout);
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Local API error ${response.status}: ${errorText}`);
-    }
-
-    const data = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-    const result = data.choices?.[0]?.message?.content || '';
-
-    // Strip <think>...</think> blocks (deepseek-r1 etc.)
-    const cleaned = result.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-
-    history.push({ role: 'assistant', content: cleaned });
-
-    logger.info(
-      { model, group: groupFolder, responseLength: cleaned.length },
-      'Local LLM response received',
-    );
-
-    return { status: 'success', result: cleaned };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    logger.error({ model, group: groupFolder, error: message }, 'Local LLM error');
-    return { status: 'error', result: null, error: message };
-  }
-}
-
-async function runOpenRouter(
-  model: string,
-  prompt: string,
-  groupFolder: string,
-  input?: HostAgentInput,
-): Promise<HostAgentOutput> {
-  const systemPrompt = getSystemPrompt(groupFolder, 'openrouter');
-  const userText = extractMessagesForLocal(prompt);
-
-  const historyKey = `openrouter_${groupFolder}`;
-  if (!conversationHistory[historyKey]) {
-    conversationHistory[historyKey] = [];
-  }
-  const history = conversationHistory[historyKey];
-  history.push({ role: 'user', content: userText });
-
-  while (history.length > MAX_HISTORY) {
-    history.shift();
-  }
-
-  const messages = [
-    { role: 'system', content: systemPrompt },
-    ...history,
-  ];
-
-  const canStream = !!(input?.onStreamChunk);
-
-  // Models known to NOT support function calling
-  const NO_TOOLS_MODELS = ['x-ai/grok', 'mistral', 'llama', 'deepseek'];
-  const supportsTools = !NO_TOOLS_MODELS.some(prefix => model.includes(prefix));
-
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), AGENT_TIMEOUT);
-
-    const body: Record<string, unknown> = { model, messages, stream: canStream };
-
-    // Only send tools to models that support function calling
-    if (supportsTools) {
-      body.tools = getToolDefinitions();
-      body.tool_choice = 'auto';
-    }
-
-    const response = await fetch(`${OPENROUTER_API_BASE_URL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeout);
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`OpenRouter API error ${response.status}: ${errorText}`);
-    }
-
-    let result = '';
-
-    if (canStream) {
-      let toolCalls: Array<{
-        id: string; type: string;
-        function: { name: string; arguments: string };
-      }> | null = null;
-
-      for await (const event of parseSSEStream(response)) {
-        if (event.type === 'delta' && event.content) {
-          result += event.content;
-          await input!.onStreamChunk!(event.content);
-        } else if (event.type === 'tool_calls') {
-          toolCalls = event.tool_calls || null;
-        }
-      }
-
-      // Handle tool calls (same logic as DeepSeek)
-      if (toolCalls && toolCalls.length > 0 && supportsTools) {
-        for (const tc of toolCalls) {
-          const handler = getToolHandler(tc.function.name);
-          let toolResult: string;
-          if (!handler) {
-            toolResult = `Error: unknown tool "${tc.function.name}"`;
-          } else {
-            try {
-              const args = JSON.parse(tc.function.arguments);
-              logger.info({ tool: tc.function.name, args }, 'Executing OpenRouter tool call');
-              if (input?.onStreamChunk) await input.onStreamChunk(`\n⚙️ ${tc.function.name}...\n`);
-              toolResult = await handler(args);
-            } catch (err) {
-              toolResult = `Tool error: ${err instanceof Error ? err.message : String(err)}`;
-            }
-          }
-          logger.info({ tool: tc.function.name, resultLength: toolResult.length }, 'OpenRouter tool completed');
-          // For now, append tool result as text (OpenRouter doesn't always support multi-turn tool calls)
-          result += `\n${toolResult}`;
-        }
-      }
-      result = result.trim();
-    } else {
-      const data = (await response.json()) as {
-        choices?: Array<{
-          message?: {
-            content?: string;
-            tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }>;
-          };
-        }>;
-      };
-
-      const msg = data.choices?.[0]?.message;
-      result = msg?.content || '';
-
-      if (msg?.tool_calls && msg.tool_calls.length > 0 && supportsTools) {
-        for (const tc of msg.tool_calls) {
-          const handler = getToolHandler(tc.function.name);
-          if (handler) {
-            try {
-              const args = JSON.parse(tc.function.arguments);
-              logger.info({ tool: tc.function.name, args }, 'Executing OpenRouter tool call');
-              const toolResult = await handler(args);
-              result += `\n${toolResult}`;
-            } catch (err) {
-              logger.error({ tool: tc.function.name, err }, 'OpenRouter tool error');
-            }
-          }
-        }
-      }
-      result = result.trim();
-    }
-
-    history.push({ role: 'assistant', content: result });
-
-    logger.info({ model, group: groupFolder, responseLength: result.length }, 'OpenRouter response received');
-
-    if (userText.length > 100 || result.length > 100) {
-      writeObsidianContext(
-        `## Last OpenRouter Exchange\n\nUser: ${userText.slice(0, 200)}\n\nAssistant: ${result.slice(0, 200)}`,
-      );
-    }
-
-    return { status: 'success', result };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    logger.error({ model, group: groupFolder, error: message }, 'OpenRouter error');
-    return { status: 'error', result: null, error: message };
-  }
-}
-
-const MAX_TOOL_ROUNDS = 10; // tool call rounds (generous, most tasks use 1-3)
-
-/**
- * Parse SSE stream from DeepSeek API, yielding content deltas and tool calls.
- */
 async function* parseSSEStream(response: Response): AsyncGenerator<{
   type: 'delta' | 'tool_calls' | 'done';
   content?: string;
-  tool_calls?: Array<{
-    id: string;
-    type: string;
-    function: { name: string; arguments: string };
-  }>;
+  tool_calls?: any[];
 }> {
   const reader = response.body?.getReader();
   if (!reader) return;
 
   const decoder = new TextDecoder();
   let buffer = '';
-
-  // Accumulate tool call fragments across chunks
-  const toolCallAccum: Record<number, { id: string; type: string; function: { name: string; arguments: string } }> = {};
-  let hasToolCalls = false;
+  const toolCallAccum: Record<number, any> = {};
 
   while (true) {
     const { done, value } = await reader.read();
@@ -413,318 +232,186 @@ async function* parseSSEStream(response: Response): AsyncGenerator<{
       if (!line.startsWith('data: ')) continue;
       const data = line.slice(6).trim();
       if (data === '[DONE]') {
-        if (hasToolCalls) {
+        if (Object.keys(toolCallAccum).length > 0) {
           yield {
             type: 'tool_calls',
             tool_calls: Object.values(toolCallAccum),
           };
         }
-        yield { type: 'done' };
         return;
       }
 
       try {
-        const parsed = JSON.parse(data) as {
-          choices?: Array<{
-            delta?: {
-              content?: string | null;
-              tool_calls?: Array<{
-                index: number;
-                id?: string;
-                type?: string;
-                function?: { name?: string; arguments?: string };
-              }>;
-            };
-            finish_reason?: string | null;
-          }>;
-        };
-
+        const parsed = JSON.parse(data);
         const delta = parsed.choices?.[0]?.delta;
         if (!delta) continue;
 
-        // Content delta
-        if (delta.content) {
-          yield { type: 'delta', content: delta.content };
-        }
-
-        // Tool call deltas (streamed incrementally)
+        if (delta.content) yield { type: 'delta', content: delta.content };
         if (delta.tool_calls) {
-          hasToolCalls = true;
           for (const tc of delta.tool_calls) {
             const idx = tc.index;
-            if (!toolCallAccum[idx]) {
+            if (!toolCallAccum[idx])
               toolCallAccum[idx] = {
-                id: tc.id || '',
-                type: tc.type || 'function',
-                function: { name: tc.function?.name || '', arguments: '' },
+                id: tc.id,
+                function: { name: '', arguments: '' },
               };
-            } else {
-              if (tc.id) toolCallAccum[idx].id = tc.id;
-              if (tc.function?.name) toolCallAccum[idx].function.name = tc.function.name;
-            }
-            if (tc.function?.arguments) {
+            if (tc.id) toolCallAccum[idx].id = tc.id;
+            if (tc.function?.name)
+              toolCallAccum[idx].function.name += tc.function.name;
+            if (tc.function?.arguments)
               toolCallAccum[idx].function.arguments += tc.function.arguments;
-            }
           }
         }
-
-        // Check finish_reason for tool_calls (some models emit this instead of [DONE])
-        const finishReason = parsed.choices?.[0]?.finish_reason;
-        if (finishReason === 'tool_calls' && hasToolCalls) {
-          yield {
-            type: 'tool_calls',
-            tool_calls: Object.values(toolCallAccum),
-          };
-          return;
-        }
       } catch {
-        // Skip malformed JSON chunks
+        /* skip malformed */
       }
     }
   }
 }
 
-async function runDeepSeekDirect(
+const MAX_TOOL_ROUNDS = 5;
+
+async function runOpenRouter(
   model: string,
   prompt: string,
   groupFolder: string,
   input?: HostAgentInput,
 ): Promise<HostAgentOutput> {
-  const systemPrompt = getSystemPrompt(groupFolder, 'deepseek-direct');
-  const userText = extractMessagesForLocal(prompt);
+  const systemPrompt = getSystemPrompt(groupFolder, 'openrouter');
+  const userText = extractPromptText(prompt);
 
-  const historyKey = `deepseek_${groupFolder}`;
-  if (!conversationHistory[historyKey]) {
-    conversationHistory[historyKey] = [];
-  }
+  const historyKey = `openrouter_${groupFolder}`;
+  if (!conversationHistory[historyKey]) conversationHistory[historyKey] = [];
   const history = conversationHistory[historyKey];
-  history.push({ role: 'user', content: userText });
 
-  while (history.length > MAX_HISTORY) {
-    history.shift();
-  }
+  // Build user message — Vision or plain text
+  const userMessage = input?.imageBase64
+    ? {
+        role: 'user' as const,
+        content: [
+          {
+            type: 'image_url',
+            image_url: {
+              url: `data:${input.imageMimeType || 'image/jpeg'};base64,${input.imageBase64}`,
+            },
+          },
+          { type: 'text', text: userText || '描述這張圖片' },
+        ],
+      }
+    : { role: 'user' as const, content: userText };
 
-  const messages: Array<Record<string, unknown>> = [
+  history.push(userMessage);
+  while (history.length > MAX_HISTORY) history.shift();
+
+  // Inject per-turn behavioral anchor as the last system message before user input.
+  // Keeps critical rules close to the decision point regardless of history length.
+  const toolNames = getToolDefinitions()
+    .map((t) => t.function.name)
+    .join(', ');
+  const behaviorAnchor = `[本輪強制規則]
+1. 有工具可用時直接呼叫，禁止在回覆文字中描述「我打算呼叫 X」
+2. 可用工具只有: ${toolNames} — 不得呼叫清單以外的工具
+3. 查本機檔案/執行命令→bash；查筆記記憶→qmd_search；分析圖片→用戶需直接傳照片
+4. 不反問用戶，不確定時先用 qmd_search 或 bash 自行查詢`;
+
+  const messages: any[] = [
     { role: 'system', content: systemPrompt },
-    ...history,
-  ];
-
+    ...history.slice(0, -1),
+    { role: 'system', content: behaviorAnchor },
+    history[history.length - 1],
+  ].filter(Boolean);
+  const canStream = !!input?.onStreamChunk;
   const tools = getToolDefinitions();
-  const canStream = !!(input?.onStreamChunk);
 
   try {
     let finalResult = '';
-
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), AGENT_TIMEOUT);
-
-      // Tool rounds use non-streaming; final response streams if callback available
-      const isToolRound = round < MAX_TOOL_ROUNDS - 1;
-      const useStream = canStream; // stream all rounds, handle tool_calls from stream
-
-      const body: Record<string, unknown> = {
-        model,
-        messages,
-        stream: useStream,
-      };
-
-      if (tools.length > 0) {
-        body.tools = tools;
-        body.tool_choice = 'auto';
-      }
-
-      logger.info({ model, toolCount: tools.length, round, stream: useStream }, 'DeepSeek API request');
-
-      const response = await fetch(`${DEEPSEEK_API_BASE_URL}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
+      const response = await rateLimitedFetch(
+        `${OPENROUTER_API_BASE_URL}/chat/completions`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+            'X-Title': 'NanoClaw',
+          },
+          body: JSON.stringify({
+            model,
+            messages,
+            stream: canStream,
+            tools: tools.length > 0 ? tools : undefined,
+            tool_choice: tools.length > 0 ? 'auto' : undefined,
+            ...(model.includes('grok-3-mini')
+              ? { reasoning: { effort: 'none' } }
+              : {}),
+          }),
         },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
+      );
 
-      clearTimeout(timeout);
+      if (!response.ok)
+        throw new Error(
+          `OpenRouter Error: ${response.status} ${await response.text()}`,
+        );
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`DeepSeek API error ${response.status}: ${errorText}`);
-      }
-
-      if (useStream) {
-        // Streaming path
+      if (canStream) {
         let streamedContent = '';
-        let toolCalls: Array<{
-          id: string;
-          type: string;
-          function: { name: string; arguments: string };
-        }> | null = null;
-
+        let toolCalls = null;
         for await (const event of parseSSEStream(response)) {
           if (event.type === 'delta' && event.content) {
             streamedContent += event.content;
             await input!.onStreamChunk!(event.content);
           } else if (event.type === 'tool_calls') {
-            toolCalls = event.tool_calls || null;
+            toolCalls = event.tool_calls;
           }
         }
 
         if (toolCalls && toolCalls.length > 0) {
-          // Handle tool calls
           messages.push({
             role: 'assistant',
             content: streamedContent || null,
             tool_calls: toolCalls,
           });
-
           for (const tc of toolCalls) {
             const handler = getToolHandler(tc.function.name);
-            let toolResult: string;
-
-            if (!handler) {
-              toolResult = `Error: unknown tool "${tc.function.name}"`;
-            } else {
-              try {
-                const args = JSON.parse(tc.function.arguments);
-                logger.info({ tool: tc.function.name, args, round }, 'Executing tool call');
-                // Notify user about tool execution
-                if (input?.onStreamChunk) {
-                  await input.onStreamChunk(`\n⚙️ ${tc.function.name}...\n`);
-                }
-                toolResult = await handler(args);
-              } catch (err) {
-                toolResult = `Tool error: ${err instanceof Error ? err.message : String(err)}`;
-              }
-            }
-
-            messages.push({ role: 'tool', tool_call_id: tc.id, content: toolResult });
-            logger.info({ tool: tc.function.name, resultLength: toolResult.length, round }, 'Tool call completed');
+            const toolResult = handler
+              ? await handler(JSON.parse(tc.function.arguments))
+              : 'Unknown tool';
+            messages.push({
+              role: 'tool',
+              tool_call_id: tc.id,
+              content: toolResult,
+            });
           }
           continue;
         }
-
-        // No tool calls — streaming text is the final result
-        finalResult = streamedContent.trim();
+        finalResult = streamedContent;
         break;
       } else {
-        // Non-streaming path (fallback)
-        const data = (await response.json()) as {
-          choices?: Array<{
-            message?: {
-              role?: string;
-              content?: string | null;
-              tool_calls?: Array<{
-                id: string;
-                type: string;
-                function: { name: string; arguments: string };
-              }>;
-            };
-            finish_reason?: string;
-          }>;
-        };
-
-        const choice = data.choices?.[0];
-        const msg = choice?.message;
-        if (!msg) throw new Error('No message in DeepSeek response');
-
-        if (msg.tool_calls && msg.tool_calls.length > 0) {
-          messages.push({
-            role: 'assistant',
-            content: msg.content || null,
-            tool_calls: msg.tool_calls,
-          });
-
+        const data = await response.json();
+        const msg = data.choices?.[0]?.message;
+        if (msg.tool_calls) {
+          messages.push(msg);
           for (const tc of msg.tool_calls) {
             const handler = getToolHandler(tc.function.name);
-            let toolResult: string;
-
-            if (!handler) {
-              toolResult = `Error: unknown tool "${tc.function.name}"`;
-            } else {
-              try {
-                const args = JSON.parse(tc.function.arguments);
-                logger.info({ tool: tc.function.name, args, round }, 'Executing tool call');
-                toolResult = await handler(args);
-              } catch (err) {
-                toolResult = `Tool error: ${err instanceof Error ? err.message : String(err)}`;
-              }
-            }
-
-            messages.push({ role: 'tool', tool_call_id: tc.id, content: toolResult });
-            logger.info({ tool: tc.function.name, resultLength: toolResult.length, round }, 'Tool call completed');
+            const toolResult = handler
+              ? await handler(JSON.parse(tc.function.arguments))
+              : 'Unknown tool';
+            messages.push({
+              role: 'tool',
+              tool_call_id: tc.id,
+              content: toolResult,
+            });
           }
           continue;
         }
-
-        finalResult = (msg.content || '').trim();
+        finalResult = msg.content;
         break;
       }
     }
-
-    // If loop exhausted all rounds on tool calls with no final text,
-    // make one more call WITHOUT tools to force a text response
-    if (!finalResult && messages.length > 2) {
-      logger.info({ model, group: groupFolder }, 'Tool rounds exhausted, forcing final response');
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), AGENT_TIMEOUT);
-
-      const finalBody: Record<string, unknown> = {
-        model,
-        messages,
-        stream: !!canStream,
-        // No tools — force text response
-      };
-
-      const finalResponse = await fetch(`${DEEPSEEK_API_BASE_URL}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${DEEPSEEK_API_KEY}`,
-        },
-        body: JSON.stringify(finalBody),
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeout);
-
-      if (finalResponse.ok) {
-        if (canStream) {
-          for await (const event of parseSSEStream(finalResponse)) {
-            if (event.type === 'delta' && event.content) {
-              finalResult += event.content;
-              await input!.onStreamChunk!(event.content);
-            }
-          }
-          finalResult = finalResult.trim();
-        } else {
-          const data = (await finalResponse.json()) as {
-            choices?: Array<{ message?: { content?: string } }>;
-          };
-          finalResult = data.choices?.[0]?.message?.content?.trim() || '';
-        }
-      }
-    }
-
     history.push({ role: 'assistant', content: finalResult });
-
-    logger.info(
-      { model, group: groupFolder, responseLength: finalResult.length },
-      'DeepSeek direct response received',
-    );
-
-    if (userText.length > 100 || finalResult.length > 100) {
-      writeObsidianContext(
-        `## Last DeepSeek Exchange\n\nUser: ${userText.slice(0, 200)}\n\nAssistant: ${finalResult.slice(0, 200)}`,
-      );
-    }
-
     return { status: 'success', result: finalResult };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    logger.error({ model, group: groupFolder, error: message }, 'DeepSeek direct error');
-    return { status: 'error', result: null, error: message };
+    return { status: 'error', result: null, error: String(err) };
   }
 }
 
@@ -734,177 +421,76 @@ async function runGemini(
   groupFolder: string,
 ): Promise<HostAgentOutput> {
   const systemPrompt = getSystemPrompt(groupFolder, 'gemini');
-  const userText = extractMessagesForLocal(prompt);
-
-  // Manage conversation history (separate from other backends)
-  const historyKey = `gemini_${groupFolder}`;
-  if (!conversationHistory[historyKey]) {
-    conversationHistory[historyKey] = [];
-  }
-  const history = conversationHistory[historyKey];
-  history.push({ role: 'user', content: userText });
-
-  while (history.length > MAX_HISTORY) {
-    history.shift();
-  }
+  const userText = extractPromptText(prompt);
 
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), AGENT_TIMEOUT);
-
-    // Gemini API expects messages in a specific format
-    const contents = history.map((msg) => ({
-      role: msg.role === 'user' ? 'user' : 'model',
-      parts: [{ text: msg.content }],
-    }));
-
-    // Prepend system instruction as user message
-    contents.unshift({
-      role: 'user',
-      parts: [{ text: `System instructions:\n${systemPrompt}` }],
-    });
-
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`,
       {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          contents,
-          generationConfig: {
-            temperature: 1,
-            topK: 40,
-            topP: 0.95,
-          },
+          systemInstruction: { parts: [{ text: systemPrompt }] },
+          contents: [{ role: 'user', parts: [{ text: userText }] }],
         }),
-        signal: controller.signal,
       },
     );
-
-    clearTimeout(timeout);
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Gemini API error ${response.status}: ${errorText}`);
-    }
-
-    const data = (await response.json()) as {
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-    };
-
-    const result = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    const cleaned = result.trim();
-
-    history.push({ role: 'assistant', content: cleaned });
-
-    logger.info(
-      { model, group: groupFolder, responseLength: cleaned.length },
-      'Gemini response received',
-    );
-
-    // Save important exchanges to Obsidian
-    if (userText.length > 100 || cleaned.length > 100) {
-      writeObsidianContext(
-        `## Last Gemini Analysis\n\nUser: ${userText.slice(0, 200)}\n\nAssistant: ${cleaned.slice(0, 200)}`,
-      );
-    }
-
-    return { status: 'success', result: cleaned };
+    if (!response.ok) throw new Error(`Gemini Error: ${response.status}`);
+    const data = await response.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    return { status: 'success', result: cleanModelOutput(text) };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    logger.error({ model, group: groupFolder, error: message }, 'Gemini error');
-    return { status: 'error', result: null, error: message };
+    return { status: 'error', result: null, error: String(err) };
   }
 }
 
-/**
- * Gemini Vision: analyze image with optional text prompt.
- */
 async function runGeminiVision(
   imageBase64: string,
   mimeType: string,
   textPrompt: string,
   groupFolder: string,
 ): Promise<HostAgentOutput> {
-  if (!GEMINI_API_KEY) {
-    return { status: 'error', result: null, error: 'Gemini API key not configured' };
-  }
-
   const systemPrompt = getSystemPrompt(groupFolder, 'gemini');
-
-  const parts: Array<Record<string, unknown>> = [];
-
-  // System instruction as text
-  parts.push({ text: `System instructions:\n${systemPrompt}` });
-
-  // Image
-  parts.push({
-    inline_data: {
-      mime_type: mimeType,
-      data: imageBase64,
-    },
-  });
-
-  // User text (caption or default)
-  parts.push({ text: textPrompt || '描述這張圖片' });
-
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), AGENT_TIMEOUT);
-
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          contents: [{ role: 'user', parts }],
-          generationConfig: { temperature: 0.7 },
+          systemInstruction: { parts: [{ text: systemPrompt }] },
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                { inline_data: { mime_type: mimeType, data: imageBase64 } },
+                { text: textPrompt || '描述圖片' },
+              ],
+            },
+          ],
         }),
-        signal: controller.signal,
       },
     );
-
-    clearTimeout(timeout);
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Gemini Vision API error ${response.status}: ${errorText}`);
-    }
-
-    const data = (await response.json()) as {
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-    };
-
-    const result = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
-
-    logger.info(
-      { group: groupFolder, responseLength: result.length },
-      'Gemini Vision response received',
-    );
-
-    return { status: 'success', result };
+    const data = await response.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    return { status: 'success', result: text };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    logger.error({ group: groupFolder, error: message }, 'Gemini Vision error');
-    return { status: 'error', result: null, error: message };
+    return { status: 'error', result: null, error: String(err) };
   }
 }
 
-// Frozen backends — return error with suggestion to use terminal directly
 async function runClaudeCli(): Promise<HostAgentOutput> {
-  return { status: 'error', result: '此功能已凍結。請直接在終端使用 Claude Code。', error: 'frozen' };
+  return { status: 'error', result: '請在終端使用 claude。', error: 'frozen' };
 }
 
 async function runOpenCode(): Promise<HostAgentOutput> {
-  return { status: 'error', result: '此功能已凍結。請直接在終端使用 OpenCode。', error: 'frozen' };
+  return {
+    status: 'error',
+    result: '請在終端使用 opencode。',
+    error: 'frozen',
+  };
 }
 
-/**
- * Dispatch a single backend call.
- */
 async function dispatchBackend(
   backend: Backend,
   model: string,
@@ -912,199 +498,140 @@ async function dispatchBackend(
   groupFolder: string,
   input: HostAgentInput,
 ): Promise<HostAgentOutput> {
-  switch (backend) {
-    case 'local':
-      return runLocal(model, prompt, groupFolder);
-    case 'deepseek-direct':
-      return runDeepSeekDirect(model, prompt, groupFolder, input);
-    case 'gemini':
-      return runGemini(model, prompt, groupFolder);
-    case 'openrouter':
-      return runOpenRouter(model, prompt, groupFolder, input);
-    case 'opencode':
-      return runOpenCode();
-    case 'claude':
-      return runClaudeCli();
-    default:
-      return { status: 'error', result: null, error: `Unknown backend: ${backend}` };
+  const start = LoadBalancer.startRequest(backend);
+  let result: HostAgentOutput;
+  try {
+    switch (backend) {
+      case 'gemini':
+        result = await runGemini(model, prompt, groupFolder);
+        break;
+      case 'openrouter':
+        result = await runOpenRouter(model, prompt, groupFolder, input);
+        break;
+      case 'opencode':
+        result = await runOpenCode();
+        break;
+      case 'claude':
+        result = await runClaudeCli();
+        break;
+      default:
+        result = {
+          status: 'error',
+          result: null,
+          error: `Unknown backend: ${backend}`,
+        };
+    }
+  } catch (err) {
+    result = { status: 'error', result: null, error: String(err) };
+  } finally {
+    LoadBalancer.endRequest(backend, start, result!.status === 'error');
   }
+  return result!;
 }
 
 export async function runHostAgent(
   group: RegisteredGroup,
   input: HostAgentInput,
 ): Promise<HostAgentOutput> {
-  // Initialize Obsidian memory on first run
-  initializeObsidianMemory();
-
   const startTime = Date.now();
-
-  // Vision shortcut: image → Gemini Vision directly (skip model-router)
-  if (input.imageBase64 && input.imageMimeType) {
-    logger.info({ group: group.name }, 'Routing image to Gemini Vision');
-    const userText = extractMessagesForLocal(input.prompt);
-    let output = await runGeminiVision(
-      input.imageBase64,
-      input.imageMimeType,
-      userText,
-      input.groupFolder,
-    );
-    if (output.result) {
-      output.result = cleanModelOutput(output.result);
-      output.result = `${output.result}\n[圖片 → ${GEMINI_MODEL}]`;
-    }
-    const duration = Date.now() - startTime;
-    logger.info({ group: group.name, backend: 'gemini-vision', duration, status: output.status }, 'Vision completed');
-    return output;
-  }
-
-  const route = routeMessage(input.prompt, !!input.isScheduledTask);
-
-  logger.info(
-    {
-      group: group.name,
-      backend: route.backend,
-      model: route.model,
-      isScheduledTask: input.isScheduledTask,
-    },
-    'Routing message',
-  );
-
-  let output = await dispatchBackend(route.backend, route.model, route.prompt, input.groupFolder, input);
+  const route = routeMessage(input.prompt, input.isScheduledTask || false);
   let usedBackend = route.backend;
   let usedModel = route.model;
 
-  // Fallback chain: if primary fails, try alternatives (including prefix commands)
+  let output = await dispatchBackend(
+    usedBackend,
+    usedModel,
+    route.prompt,
+    input.groupFolder,
+    input,
+  );
+
   if (output.status === 'error') {
-    const fallbacks = getFallbackChain(route.backend);
-    for (const fb of fallbacks) {
-      logger.warn(
-        { group: group.name, failedBackend: usedBackend, tryingBackend: fb.backend, tryingModel: fb.model },
-        'Backend failed, trying fallback',
-      );
-      output = await dispatchBackend(fb.backend, fb.model, route.prompt, input.groupFolder, input);
+    for (const fb of getFallbackChain(usedBackend)) {
       usedBackend = fb.backend;
       usedModel = fb.model;
-      if (output.status === 'success') {
-        route.reason = 'fallback';
-        route.backend = fb.backend;
-        route.model = fb.model;
-        break;
-      }
+      output = await dispatchBackend(
+        usedBackend,
+        usedModel,
+        route.prompt,
+        input.groupFolder,
+        input,
+      );
+      if (output.status === 'success') break;
     }
   }
 
-  // Clean leaked XML/function call syntax from output
-  if (output.result) {
-    output.result = cleanModelOutput(output.result);
+  // Post-response hooks (non-blocking)
+  if (output.status === 'success' && !input.isScheduledTask) {
+    const history = conversationHistory[`openrouter_${input.groupFolder}`] || [];
+    const toolsUsed = history
+      .filter((m: any) => m.role === 'tool')
+      .map((m: any) => String(m.tool_call_id || '').split('_')[0])
+      .filter(Boolean);
+
+    // 1. Append @LAST line to Current_Context.md (instant, code-only)
+    setImmediate(() =>
+      autoAppendActivityLog(input.groupFolder, input.prompt, toolsUsed),
+    );
+
+    // 2. Persist conversation to Obsidian daily log (qmd-searchable forever)
+    setImmediate(() =>
+      appendConversationLog(
+        input.groupFolder,
+        usedModel,
+        input.prompt,
+        output.result ?? '',
+      ),
+    );
+
+    // 3. Rewrite WAKE.md NOW section via GLM-flash (async, ~1-2s)
+    void updateWakeNow(input.prompt, output.result ?? '');
   }
 
-  // Append route signature to result
-  if (output.result) {
-    output.result = `${output.result}\n${formatRouteSignature(route)}`;
-  }
-
-  const duration = Date.now() - startTime;
   logger.info(
     {
-      group: group.name,
       backend: usedBackend,
       model: usedModel,
-      reason: route.reason,
-      duration,
-      status: output.status,
+      duration: Date.now() - startTime,
     },
     'Agent completed',
   );
-
   return output;
 }
 
-/**
- * Check that backends are available.
- */
 export async function ensureBackendsAvailable(): Promise<void> {
-  // Check local API (OpenAI-compatible)
-  try {
-    const headers: Record<string, string> = {};
-    if (LOCAL_API_KEY) {
-      headers['Authorization'] = `Bearer ${LOCAL_API_KEY}`;
-    }
-    const res = await fetch(`${LOCAL_API_BASE_URL}/models`, {
-      headers,
-      signal: AbortSignal.timeout(5000),
-    });
-    if (res.ok) {
-      const data = (await res.json()) as {
-        data?: Array<{ id: string }>;
-      };
-      const models = data.data?.map((m) => m.id) || [];
-      logger.info({ models, url: LOCAL_API_BASE_URL }, 'Local API available');
-    } else {
-      logger.warn({ status: res.status }, 'Local API responded with error');
-    }
-  } catch (err) {
-    logger.warn(
-      { error: err instanceof Error ? err.message : String(err) },
-      'Local API not available — local models will fail',
-    );
-  }
-
-  // Check OpenRouter API
   if (OPENROUTER_API_KEY) {
     try {
       const res = await fetch(`${OPENROUTER_API_BASE_URL}/models`, {
-        headers: {
-          'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-        },
+        headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}` },
         signal: AbortSignal.timeout(5000),
       });
-      if (res.ok) {
-        logger.info({ url: OPENROUTER_API_BASE_URL }, 'OpenRouter API available');
-      } else {
-        logger.warn({ status: res.status }, 'OpenRouter API error');
-      }
-    } catch (err) {
-      logger.warn(
-        { error: err instanceof Error ? err.message : String(err) },
-        'OpenRouter API not available',
-      );
+      if (res.ok) logger.info('OpenRouter API available');
+    } catch {
+      logger.warn('OpenRouter API not available');
     }
-  } else {
-    logger.info('OpenRouter API key not configured');
   }
-
-  // Check Gemini API
   if (GEMINI_API_KEY) {
     try {
       const res = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
         {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             contents: [{ role: 'user', parts: [{ text: 'test' }] }],
           }),
           signal: AbortSignal.timeout(5000),
         },
       );
-      if (res.status === 200 || res.status === 400) {
-        logger.info('Gemini API available');
-      } else {
-        logger.warn({ status: res.status }, 'Gemini API error');
-      }
-    } catch (err) {
-      logger.warn(
-        { error: err instanceof Error ? err.message : String(err) },
-        'Gemini API not available',
-      );
+      if (res.ok || res.status === 400) logger.info('Gemini API available');
+    } catch {
+      logger.warn('Gemini API not available');
     }
-  } else {
-    logger.info('Gemini API key not configured');
   }
-
-  // Initialize Obsidian memory
   initializeObsidianMemory();
+
+  // Start daily memory distillation check (runs immediately + every 24h)
+  void distillMemoryIfNeeded();
+  setInterval(() => void distillMemoryIfNeeded(), 24 * 60 * 60 * 1000);
 }

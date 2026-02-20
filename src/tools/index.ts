@@ -12,6 +12,8 @@ import { tuneLocal } from './tune-local.js';
 import { editFile } from './edit-file.js';
 import { grepSearch } from './grep.js';
 import { generateImage } from './generate-image.js';
+import { visionTool } from './vision.js';
+import { qmdSearch } from './qmd-search.js';
 
 export interface ToolDefinition {
   type: 'function';
@@ -42,6 +44,8 @@ const TOOLS: Tool[] = [
   editFile,
   grepSearch,
   generateImage,
+  visionTool,
+  qmdSearch,
 ];
 
 /** Tool definitions array for the API request */

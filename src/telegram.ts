@@ -6,16 +6,90 @@ import fs from 'fs';
 
 import { Bot, GrammyError, HttpError, InputFile } from 'grammy';
 
-import { ASSISTANT_NAME, MAIN_GROUP_FOLDER } from './config.js';
 import {
-  getMessagesSince,
-  storeTelegramMessage,
-} from './db.js';
+  ASSISTANT_NAME,
+  MAIN_GROUP_FOLDER,
+  OPENROUTER_API_KEY,
+  SE_MEOW_BOX_CHANNEL_ID,
+} from './config.js';
+import { getMessagesSince, storeTelegramMessage } from './db.js';
 import { logger } from './logger.js';
 import { getToolHandler } from './tools/index.js';
+import { storePendingImage } from './tools/vision.js';
 import { RegisteredGroup } from './types.js';
 
 const TG_JID_PREFIX = 'tg:';
+
+/**
+ * 用 DeepSeek 翻譯 + 豐富提示詞（中文 → 英文 + 詳細描述）
+ */
+async function enrichPrompt(
+  userPrompt: string,
+  nsfw = false,
+): Promise<{ finalPrompt: string; original: string }> {
+  const systemPrompt = nsfw
+    ? `You are an expert adult image generation prompt engineer for FLUX.1-schnell.
+Given a user description (may be Chinese), you must:
+1. Translate to English if needed
+2. Enrich with explicit adult details: body features, clothing state, expression, pose, skin texture, lighting, camera angle
+3. Add quality tags: masterpiece, best quality, highly detailed, 8k uhd, photorealistic
+4. Keep it under 150 words
+
+Return ONLY the final English prompt, no explanation.`
+    : `你是圖片生成提示詞專家。
+用戶給你一個圖片描述（可能是中文），你需要：
+1. 翻譯成英文（如果已是英文則保持）
+2. 豐富提示詞細節：加入風格、質感、光線、構圖、色彩等專業描述
+3. 符合 FLUX.1-schnell 模型的最佳實踐
+
+只回傳最終的英文提示詞，無需其他解釋。`;
+
+  // 固定用 OpenRouter Grok（DeepSeek 餘額不足）
+  const apiUrl = 'https://openrouter.ai/api/v1/chat/completions';
+  const apiKey = OPENROUTER_API_KEY;
+  const model = 'x-ai/grok-3-mini';
+
+  try {
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0.7,
+        max_tokens: 200,
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (!response.ok) {
+      logger.warn(
+        { status: response.status, model },
+        'Enrichment failed, using original',
+      );
+      return { finalPrompt: userPrompt, original: userPrompt };
+    }
+
+    const data = (await response.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const enriched = data.choices?.[0]?.message?.content?.trim() || userPrompt;
+
+    return { finalPrompt: enriched, original: userPrompt };
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      'Enrichment error, using original',
+    );
+    return { finalPrompt: userPrompt, original: userPrompt };
+  }
+}
 
 export function makeTelegramJid(chatId: number): string {
   return `${TG_JID_PREFIX}${chatId}`;
@@ -38,8 +112,7 @@ interface TelegramConfig {
       onStreamChunk: (chunk: string) => Promise<void>;
       onStreamDone: () => Promise<string>;
     },
-    imageBase64?: string,
-    imageMimeType?: string,
+    imageData?: { imageBase64: string; imageMimeType: string },
   ) => Promise<string | null>;
   getRegisteredGroups: () => Record<string, RegisteredGroup>;
   getSessions: () => Record<string, string>;
@@ -74,7 +147,10 @@ export async function connectTelegram(
     } else if (e instanceof HttpError) {
       logger.error({ err: e.message }, 'Telegram HTTP/network error');
     } else {
-      logger.error({ err: e, updateId: ctx?.update?.update_id }, 'Telegram handler error');
+      logger.error(
+        { err: e, updateId: ctx?.update?.update_id },
+        'Telegram handler error',
+      );
     }
   });
 
@@ -87,9 +163,7 @@ export async function connectTelegram(
     const chatJid = makeTelegramJid(msg.chat.id);
     const timestamp = new Date(msg.date * 1000).toISOString();
     const senderName =
-      msg.from.first_name ||
-      msg.from.username ||
-      String(msg.from.id);
+      msg.from.first_name || msg.from.username || String(msg.from.id);
     const sender = String(msg.from.id);
     const caption = msg.caption || '';
 
@@ -128,12 +202,18 @@ export async function connectTelegram(
 
     // Determine MIME type from file path
     const ext = file.file_path?.split('.').pop()?.toLowerCase() || 'jpg';
-    const mimeMap: Record<string, string> = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp' };
+    const mimeMap: Record<string, string> = {
+      jpg: 'image/jpeg',
+      jpeg: 'image/jpeg',
+      png: 'image/png',
+      gif: 'image/gif',
+      webp: 'image/webp',
+    };
     const mimeType = mimeMap[ext] || 'image/jpeg';
 
     logger.info(
       { chat: msg.chat.id, fileSize: photo.file_size, mimeType },
-      'Processing Telegram photo',
+      'Received Telegram photo, routing to Vision model',
     );
 
     // Keep typing indicator alive
@@ -141,15 +221,23 @@ export async function connectTelegram(
     const typingInterval = setInterval(async () => {
       try {
         await bot!.api.sendChatAction(msg.chat.id, 'typing');
-      } catch { /* best effort */ }
+      } catch {
+        /* best effort */
+      }
     }, 4000);
 
-    // Build prompt with caption context
+    // Build prompt — caption or default vision instruction
     const prompt = caption
       ? `<messages>\n<message sender="${senderName}" time="${timestamp}">${caption}</message>\n</messages>`
-      : `<messages>\n<message sender="${senderName}" time="${timestamp}">[用戶發送了一張圖片，請描述並分析]</message>\n</messages>`;
+      : `<messages>\n<message sender="${senderName}" time="${timestamp}">描述這張圖片</message>\n</messages>`;
 
-    const response = await config.runAgent(group, prompt, chatJid, undefined, imageBase64, mimeType);
+    const response = await config.runAgent(
+      group,
+      prompt,
+      chatJid,
+      undefined,
+      { imageBase64, imageMimeType: mimeType },
+    );
     clearInterval(typingInterval);
 
     if (response) {
@@ -166,7 +254,14 @@ export async function connectTelegram(
         true,
       );
 
-      await sendTelegramMessage(msg.chat.id, response);
+      const showKeyboard = ASSISTANT_NAME === '瑟喵助手';
+      logger.info(
+        { ASSISTANT_NAME, showKeyboard, chatJid },
+        'Deciding to show Telegram keyboard',
+      );
+      await sendTelegramMessage(msg.chat.id, response, {
+        showNsfwKeyboard: showKeyboard,
+      });
     }
   });
 
@@ -179,9 +274,7 @@ export async function connectTelegram(
     const chatJid = makeTelegramJid(msg.chat.id);
     const timestamp = new Date(msg.date * 1000).toISOString();
     const senderName =
-      msg.from.first_name ||
-      msg.from.username ||
-      String(msg.from.id);
+      msg.from.first_name || msg.from.username || String(msg.from.id);
     const sender = String(msg.from.id);
 
     // Store the message
@@ -224,33 +317,261 @@ export async function connectTelegram(
       }
     }
 
+    // Handle NSFW workflow shortcut buttons (SeMeow bot)
+    if (ASSISTANT_NAME === '瑟喵助手') {
+      if (msg.text === '🔞 啟動大腦風暴') {
+        msg.text =
+          '啟動「NSFW 大腦風暴」工作流，為我推薦三個極致的色情創作情境。喵~❤';
+      } else if (msg.text === '🎨 執行極致生圖') {
+        msg.text =
+          '請根據目前選定的視覺細節，調用生圖工具為我創作高品質的 NSFW 圖片。🐾';
+      } else if (msg.text === '🎭 進入 RP 模式') {
+        msg.text =
+          '開啟深度角色扮演。瑟喵，請入戲並帶領我進入最真實的情景。喵嗚~❤';
+      } else if (msg.text === '📊 系統狀態') {
+        msg.text = '/status';
+      } else if (msg.text === '📱 同步 TG 紀錄') {
+        msg.text = '請同步並顯示我在 Telegram 上的最近 10 條對話紀錄。';
+      } else if (msg.text === '🧠 查看記憶') {
+        msg.text = '請顯示目前的記憶狀態與主人偏好標籤。';
+      }
+    }
+
+    // /status command — show system health
+    if (msg.text === '/status') {
+      logger.info({ sender: msg.from.id }, 'Status command received');
+
+      try {
+        const { exec } = await import('node:child_process');
+        exec(
+          'export PATH="/opt/homebrew/bin:$PATH" && pm2 jlist',
+          (err, stdout) => {
+            if (err) {
+              ctx.reply('❌ 無法讀取系統狀態');
+              return;
+            }
+
+            try {
+              const pm2Data = JSON.parse(stdout);
+              const nanoclaw = pm2Data.find((p: any) => p.name === 'nanoclaw');
+
+              if (!nanoclaw) {
+                ctx.reply('❌ Bot 進程不存在（已崩潰）\n\n使用 /restart 重啟');
+                return;
+              }
+
+              const status = nanoclaw.pm2_env.status;
+              const uptime = Math.floor(
+                (Date.now() - nanoclaw.pm2_env.pm_uptime) / 1000,
+              );
+              const memory = (nanoclaw.monit.memory / 1024 / 1024).toFixed(1);
+              const restarts = nanoclaw.pm2_env.restart_time;
+
+              const uptimeStr =
+                uptime < 60
+                  ? `${uptime}s`
+                  : uptime < 3600
+                    ? `${Math.floor(uptime / 60)}m`
+                    : `${Math.floor(uptime / 3600)}h`;
+
+              const statusEmoji = status === 'online' ? '🟢' : '🔴';
+
+              ctx.reply(
+                `${statusEmoji} **系統狀態**\n\n` +
+                  `狀態: ${status}\n` +
+                  `運行時間: ${uptimeStr}\n` +
+                  `記憶體: ${memory} MB\n` +
+                  `重啟次數: ${restarts}\n` +
+                  `PID: ${nanoclaw.pid}`,
+                { parse_mode: 'Markdown' },
+              );
+            } catch (parseErr) {
+              ctx.reply('❌ 狀態資料解析失敗');
+            }
+          },
+        );
+      } catch (err) {
+        logger.error({ err }, 'Status command error');
+        await ctx.reply('❌ 讀取狀態失敗');
+      }
+      return;
+    }
+
+    // /restart command — restart bot process via PM2
+    if (msg.text === '/restart') {
+      logger.info({ sender: msg.from.id }, 'Restart command received');
+      await ctx.reply('🔄 正在重啟 bot...');
+
+      try {
+        const { exec } = await import('node:child_process');
+        exec(
+          'export PATH="/opt/homebrew/bin:$PATH" && pm2 restart nanoclaw',
+          (err, stdout) => {
+            if (err) {
+              logger.error({ err }, 'Failed to restart via PM2');
+              ctx.reply('❌ 重啟失敗，請檢查伺服器');
+            } else {
+              logger.info('Bot restarted via PM2');
+              // 新實例會自動連線，不需要回覆
+            }
+          },
+        );
+      } catch (err) {
+        logger.error({ err }, 'Restart command error');
+        await ctx.reply('❌ 重啟失敗');
+      }
+      return;
+    }
+
+    // /menu command — show quick reply keyboard (SeMeow bot)
+    if (msg.text === '/menu' || msg.text === '/start') {
+      logger.info(
+        { assistantName: ASSISTANT_NAME, command: msg.text },
+        'Menu command received',
+      );
+      if (ASSISTANT_NAME === '瑟喵助手') {
+        await ctx.reply(
+          '🐾 主人，瑟喵的快捷選單已為您準備好了... 喵嗚~❤\n\n請選擇您想要的功能：',
+          {
+            reply_markup: {
+              keyboard: [
+                [{ text: '🔞 啟動大腦風暴' }, { text: '🎨 執行極致生圖' }],
+                [{ text: '🎭 進入 RP 模式' }, { text: '📱 同步 TG 紀錄' }],
+                [{ text: '🧠 查看記憶' }, { text: '📊 系統狀態' }],
+              ],
+              resize_keyboard: true,
+              one_time_keyboard: false,
+            },
+          },
+        );
+        logger.info('SeMeow menu sent with keyboard');
+        return;
+      } else {
+        await ctx.reply('使用 /status 查看系統狀態，或直接向我提問。');
+        logger.info('Default menu response sent');
+        return;
+      }
+    }
+
     // Check trigger: 'all' = respond to everything, otherwise match pattern
     if (group.trigger && group.trigger !== 'all') {
-      const triggerMatch = msg.text.includes(group.trigger) ||
-        msg.text.startsWith('/');  // slash commands always pass
+      const triggerMatch =
+        msg.text.includes(group.trigger) || msg.text.startsWith('/'); // slash commands always pass
       if (!triggerMatch) return;
+    }
+
+    // Group chat smart silence: only respond when directly addressed
+    if (msg.chat.type === 'group' || msg.chat.type === 'supergroup') {
+      const botUsername = ctx.me.username ? `@${ctx.me.username}` : null;
+      const isMentioned = botUsername
+        ? msg.text.includes(botUsername)
+        : false;
+      const isNameMentioned = msg.text.includes(ASSISTANT_NAME);
+      const isReplyToBot =
+        msg.reply_to_message?.from?.id === ctx.me.id;
+      const isSlashCommand = msg.text.startsWith('/');
+
+      if (!isMentioned && !isNameMentioned && !isReplyToBot && !isSlashCommand) {
+        return;
+      }
+    }
+
+    // /status command — show system health report
+    if (msg.text === '/status' || msg.text === '/system') {
+      import('./observability.js').then(async (mod) => {
+        const report = await mod.Observability.getHealthReport();
+        await sendTelegramMessage(msg.chat.id, report);
+      });
+      return;
     }
 
     // /draw command — bypass model, call generate_image directly
     if (msg.text.startsWith('/draw ') || msg.text.startsWith('/draw\n')) {
-      const drawPrompt = msg.text.slice(5).trim();
-      if (!drawPrompt) {
-        await sendTelegramMessage(msg.chat.id, '用法: /draw <英文描述>');
+      const userPrompt = msg.text.slice(5).trim();
+      if (!userPrompt) {
+        await sendTelegramMessage(
+          msg.chat.id,
+          '用法: /draw <描述>（支援中文）',
+        );
         return;
       }
       await ctx.replyWithChatAction('typing');
       const typingInt = setInterval(async () => {
-        try { await bot!.api.sendChatAction(msg.chat.id, 'typing'); } catch { /* */ }
+        try {
+          await bot!.api.sendChatAction(msg.chat.id, 'typing');
+        } catch {
+          /* */
+        }
       }, 4000);
 
       try {
+        // 清除 CLAUDE.md 可能帶來的前綴（如「# 生成圖片：」）
+        const cleanPrompt = userPrompt
+          .replace(/^#\s*生成圖片[：:]\s*/u, '')
+          .trim();
+        // 翻譯 + 豐富提示詞（SeMeow自動NSFW加持）
+        const isNsfwBot = ASSISTANT_NAME === '瑟喵助手';
+        const { finalPrompt, original } = await enrichPrompt(
+          cleanPrompt,
+          isNsfwBot,
+        );
+        logger.info({ original, finalPrompt }, '/draw enrichment completed');
+
+        // 生成圖片
         const handler = getToolHandler('generate_image');
         if (!handler) throw new Error('generate_image tool not found');
-        const result = await handler({ prompt: drawPrompt });
-        logger.info({ drawPrompt, resultLength: result.length }, '/draw command executed');
+        const result = await handler({ prompt: finalPrompt });
 
-        storeTelegramMessage(`bot-${Date.now()}`, chatJid, 'bot', ASSISTANT_NAME, result, new Date().toISOString(), true);
-        await sendTelegramMessage(msg.chat.id, result);
+        // 顯示最終提示詞 + 圖片
+        const promptDisplay =
+          original !== finalPrompt
+            ? `📝 原始: ${original}\n✨ 豐富後: ${finalPrompt}\n\n${result}`
+            : `📝 提示詞: ${finalPrompt}\n\n${result}`;
+
+        logger.info(
+          { original, finalPrompt, resultLength: result.length },
+          '/draw command executed',
+        );
+
+        storeTelegramMessage(
+          `bot-${Date.now()}`,
+          chatJid,
+          'bot',
+          ASSISTANT_NAME,
+          promptDisplay,
+          new Date().toISOString(),
+          true,
+        );
+        const showKeyboard = ASSISTANT_NAME === '瑟喵助手';
+        await sendTelegramMessage(msg.chat.id, promptDisplay, {
+          showNsfwKeyboard: showKeyboard,
+        });
+
+        // @Se-Meow-Box：生圖後自動轉發到頻道
+        if (SE_MEOW_BOX_CHANNEL_ID && bot) {
+          try {
+            const imageMatch2 = result.match(/\[IMAGE:([^\]]+)\]/);
+            const tag = `🎨 prompt: ${finalPrompt.slice(0, 200)}`;
+            if (imageMatch2 && fs.existsSync(imageMatch2[1])) {
+              await bot.api.sendPhoto(
+                SE_MEOW_BOX_CHANNEL_ID,
+                new InputFile(imageMatch2[1]),
+                { caption: tag },
+              );
+            } else {
+              await bot.api.sendMessage(
+                SE_MEOW_BOX_CHANNEL_ID,
+                `🎨 [生圖記錄]\n${tag}`,
+              );
+            }
+            logger.info(
+              { channelId: SE_MEOW_BOX_CHANNEL_ID },
+              'Forwarded to Se-Meow-Box',
+            );
+          } catch (fwdErr) {
+            logger.warn({ fwdErr }, 'Failed to forward to Se-Meow-Box');
+          }
+        }
       } catch (err) {
         const errMsg = `生圖失敗: ${err instanceof Error ? err.message : String(err)}`;
         await sendTelegramMessage(msg.chat.id, errMsg);
@@ -299,7 +620,12 @@ export async function connectTelegram(
       onStreamDone: () => stream.finalize(),
     };
 
-    const response = await config.runAgent(group, prompt, chatJid, streamCallbacks);
+    const response = await config.runAgent(
+      group,
+      prompt,
+      chatJid,
+      streamCallbacks,
+    );
     clearInterval(typingInterval);
 
     if (response) {
@@ -321,7 +647,10 @@ export async function connectTelegram(
 
       // If stream already sent the message, don't send again
       if (!stream.getMessageId()) {
-        await sendTelegramMessage(msg.chat.id, response);
+        const showKeyboard = ASSISTANT_NAME === '瑟喵助手';
+        await sendTelegramMessage(msg.chat.id, response, {
+          showNsfwKeyboard: showKeyboard,
+        });
       }
     }
   });
@@ -333,7 +662,10 @@ export async function connectTelegram(
     'Connected to Telegram (grammY)',
   );
 
-  // Start long polling with retry on 409 conflict
+  // Return bot instance for health monitoring
+  (global as any).__nanoclaw_bot = bot;
+
+  // Start long polling with aggressive 409 conflict resolution
   const startPolling = async (attempt = 1): Promise<void> => {
     try {
       await bot!.start({
@@ -342,13 +674,37 @@ export async function connectTelegram(
       });
     } catch (err) {
       if (err instanceof GrammyError && err.error_code === 409) {
-        const delay = Math.min(5000 * attempt, 30000);
         logger.warn(
-          { attempt, delayMs: delay },
-          'Telegram 409 conflict — another poller active, retrying',
+          { attempt },
+          'Telegram 409 conflict detected — forcefully clearing webhook and retrying',
         );
+
+        // Aggressively clear any existing webhook or polling session
+        try {
+          await bot!.api.deleteWebhook({ drop_pending_updates: true });
+          logger.info('Webhook cleared successfully');
+        } catch (webhookErr) {
+          logger.warn(
+            { err: webhookErr },
+            'Failed to clear webhook (may not exist)',
+          );
+        }
+
+        // Wait a bit for Telegram to release the lock
+        const delay = Math.min(2000 * attempt, 10000);
         await new Promise((r) => setTimeout(r, delay));
-        return startPolling(attempt + 1);
+
+        // Retry (max 3 attempts, then fail fast)
+        if (attempt < 3) {
+          return startPolling(attempt + 1);
+        } else {
+          logger.error(
+            'Failed to start polling after 3 attempts. Please check for duplicate instances.',
+          );
+          throw new Error(
+            'Telegram 409: Multiple bot instances detected. Stop other instances first.',
+          );
+        }
       }
       throw err;
     }
@@ -397,7 +753,7 @@ function markdownToTelegramHtml(md: string): string {
     if (/^\|.*\|$/.test(processed.trim())) {
       processed = processed
         .trim()
-        .slice(1, -1)              // remove outer pipes
+        .slice(1, -1) // remove outer pipes
         .split('|')
         .map((cell) => cell.trim())
         .join('  ');
@@ -443,6 +799,7 @@ function markdownToTelegramHtml(md: string): string {
 export async function sendTelegramMessage(
   chatId: number,
   text: string,
+  options?: { showNsfwKeyboard?: boolean },
 ): Promise<void> {
   if (!bot) {
     logger.error('Telegram bot not initialized');
@@ -471,19 +828,38 @@ export async function sendTelegramMessage(
     }
   }
 
+  // Build reply markup for NSFW workflow shortcuts (SeMeow bot)
+  const replyMarkup = options?.showNsfwKeyboard
+    ? {
+        keyboard: [
+          [{ text: '💬 聊天基礎' }, { text: '🔥 聊天進階' }],
+          [{ text: '🎨 指定生圖' }, { text: '📱 頻道管理' }],
+          [{ text: '🛠️ 安裝技能' }, { text: '🧠 更新記憶' }],
+        ],
+        resize_keyboard: true,
+        one_time_keyboard: false,
+      }
+    : undefined;
+
   const html = markdownToTelegramHtml(text);
   try {
-    await bot.api.sendMessage(chatId, html, { parse_mode: 'HTML' });
+    await bot.api.sendMessage(chatId, html, {
+      parse_mode: 'HTML',
+      reply_markup: replyMarkup,
+    });
     logger.info({ chatId, length: text.length }, 'Telegram message sent');
   } catch (err) {
     // Fallback: if HTML parse fails, send as plain text
     if (err instanceof GrammyError && err.error_code === 400) {
       logger.warn({ chatId }, 'HTML parse failed, falling back to plain text');
       try {
-        await bot.api.sendMessage(chatId, text);
+        await bot.api.sendMessage(chatId, text, { reply_markup: replyMarkup });
         return;
       } catch (fallbackErr) {
-        logger.error({ chatId, err: fallbackErr }, 'Plain text fallback also failed');
+        logger.error(
+          { chatId, err: fallbackErr },
+          'Plain text fallback also failed',
+        );
         return;
       }
     }
@@ -516,7 +892,9 @@ export function createTelegramStream(chatId: number) {
     if (!messageId || !buffer) return;
     const html = markdownToTelegramHtml(buffer);
     try {
-      await botRef.api.editMessageText(chatId, messageId, html, { parse_mode: 'HTML' });
+      await botRef.api.editMessageText(chatId, messageId, html, {
+        parse_mode: 'HTML',
+      });
       lastEditTime = Date.now();
     } catch (err) {
       // If HTML fails, try plain text
@@ -540,7 +918,9 @@ export function createTelegramStream(chatId: number) {
       if (!messageId) {
         try {
           const html = markdownToTelegramHtml(buffer);
-          const msg = await botRef.api.sendMessage(chatId, html, { parse_mode: 'HTML' });
+          const msg = await botRef.api.sendMessage(chatId, html, {
+            parse_mode: 'HTML',
+          });
           messageId = msg.message_id;
           lastEditTime = Date.now();
         } catch {
@@ -571,7 +951,10 @@ export function createTelegramStream(chatId: number) {
         editTimer = null;
       }
       await flush();
-      logger.info({ chatId, length: buffer.length }, 'Telegram stream completed');
+      logger.info(
+        { chatId, length: buffer.length },
+        'Telegram stream completed',
+      );
       return buffer;
     },
 

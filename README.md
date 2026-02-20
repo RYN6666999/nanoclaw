@@ -3,163 +3,138 @@
 </p>
 
 <p align="center">
-  My personal Claude assistant that runs securely in containers. Lightweight and built to be understood and customized for your own needs.
+  個人 Telegram AI 助手。極簡架構、雙 backend 路由、圖片生成 + 視覺辨識。
 </p>
 
-## Why I Built This
+## 為什麼是 NanoClaw
 
-[OpenClaw](https://github.com/openclaw/openclaw) is an impressive project with a great vision. But I can't sleep well running software I don't understand with access to my life. OpenClaw has 52+ modules, 8 config management files, 45+ dependencies, and abstractions for 15 channel providers. Security is application-level (allowlists, pairing codes) rather than OS isolation. Everything runs in one Node process with shared memory.
+專為單一用戶設計的精簡 AI 助手。相比複雜框架：
 
-NanoClaw gives you the same core functionality in a codebase you can understand in 8 minutes. One process. A handful of files. Agents run in actual Linux containers with filesystem isolation, not behind permission checks.
+- **可讀** — 3997 行程式碼（清理後 -28%），8 分鐘內理解全貌
+- **安全隔離** — Telegram 直連，代理模型選擇（DeepSeek/Grok/Gemini）
+- **無配置** — 直接改 code，不要亂七八糟的 .env 堆積
+- **AI 原生** — 不裝 GUI，直接問 Claude 實況狀態
 
-## Quick Start
+## 快速開始
 
 ```bash
 git clone https://github.com/gavrielc/nanoclaw.git
 cd nanoclaw
-claude
+export PATH="/opt/homebrew/bin:$PATH"
+npx tsx src/index.ts
 ```
 
-Then run `/setup`. Claude Code handles everything: dependencies, authentication, container setup, service configuration.
+然後在 Telegram 發訊息到 `@ryanplus_bot`。
 
-## Philosophy
+## 功能
 
-**Small enough to understand.** One process, a few source files. No microservices, no message queues, no abstraction layers. Have Claude Code walk you through it.
+- **Telegram I/O** — grammY 長輪詢，穩定接收訊息
+- **雙 backend 路由** — DeepSeek V3（預設）+ Grok 4.1 Fast（`/x` 無審查）
+- **圖片生成** — `/draw` 支援中文，自動翻譯 + DeepSeek 豐富化，FLUX.1-schnell 高質量
+- **視覺辨識** — Telegram 圖片 → Gemini 2.0 Flash 自動分析
+- **智能搜尋** — web_search 三源融合（Grok + Brave + DuckDuckGo）+ 交叉驗證 + 置信度徽章（✅⚡📌）+ 搜尋連結
+- **10 工具** — bash, file ops, web_search, obsidian, grep, image gen, tune_local
+- **Fallback 鏈** — deepseek → openrouter → gemini → local
+- **流式輸出** — SSE streaming 實時編輯 Telegram 訊息
 
-**Secure by isolation.** Agents run in Linux containers (Apple Container on macOS, or Docker). They can only see what's explicitly mounted. Bash access is safe because commands run inside the container, not on your host.
-
-**Built for one user.** This isn't a framework. It's working software that fits my exact needs. You fork it and have Claude Code make it match your exact needs.
-
-**Customization = code changes.** No configuration sprawl. Want different behavior? Modify the code. The codebase is small enough that this is safe.
-
-**AI-native.** No installation wizard; Claude Code guides setup. No monitoring dashboard; ask Claude what's happening. No debugging tools; describe the problem, Claude fixes it.
-
-**Skills over features.** Contributors shouldn't add features (e.g. support for Telegram) to the codebase. Instead, they contribute [claude code skills](https://code.claude.com/docs/en/skills) like `/add-telegram` that transform your fork. You end up with clean code that does exactly what you need.
-
-**Best harness, best model.** This runs on Claude Agent SDK, which means you're running Claude Code directly. The harness matters. A bad harness makes even smart models seem dumb, a good harness gives them superpowers. Claude Code is (IMO) the best harness available.
-
-## What It Supports
-
-- **WhatsApp I/O** - Message Claude from your phone
-- **Isolated group context** - Each group has its own `CLAUDE.md` memory, isolated filesystem, and runs in its own container sandbox with only that filesystem mounted
-- **Main channel** - Your private channel (self-chat) for admin control; every other group is completely isolated
-- **Scheduled tasks** - Recurring jobs that run Claude and can message you back
-- **Web access** - Search and fetch content
-- **Container isolation** - Agents sandboxed in Apple Container (macOS) or Docker (macOS/Linux)
-- **Optional integrations** - Add Gmail (`/add-gmail`) and more via skills
-
-## Usage
-
-Talk to your assistant with the trigger word (default: `@Andy`):
+## 架構
 
 ```
-@Andy send an overview of the sales pipeline every weekday morning at 9am (has access to my Obsidian vault folder)
-@Andy review the git history for the past week each Friday and update the README if there's drift
-@Andy every Monday at 8am, compile news on AI developments from Hacker News and TechCrunch and message me a briefing
+Telegram (grammY) → Model Router → Backend APIs → Response
+├─ DeepSeek V3 (api.deepseek.com)
+├─ Grok 4.1 Fast (OpenRouter, /x prefix)
+├─ Gemini 2.0 Flash (Vision only)
+└─ Ollama Local (fallback)
 ```
 
-From the main channel (your self-chat), you can manage groups and tasks:
+**關鍵檔案**
+| File | 用途 |
+|------|------|
+| `src/index.ts` | 主程式：Telegram 連線、狀態管理 |
+| `src/telegram.ts` | Telegram 通道 + `/draw` 指令 |
+| `src/host-agent.ts` | LLM 呼叫 + Vision + 工具路由 |
+| `src/model-router.ts` | 前綴/關鍵字 → 模型決策 |
+| `src/config.ts` | 配置載入 + API 檢查 |
+| `src/db.ts` | SQLite 訊息存儲 |
+| `groups/{name}/CLAUDE.md` | 群組記憶 + 系統指令 |
+
+## 使用
+
+### 基本指令
 ```
-@Andy list all scheduled tasks across groups
-@Andy pause the Monday briefing task
-@Andy join the Family Chat group
-```
-
-## Customizing
-
-There are no configuration files to learn. Just tell Claude Code what you want:
-
-- "Change the trigger word to @Bob"
-- "Remember in the future to make responses shorter and more direct"
-- "Add a custom greeting when I say good morning"
-- "Store conversation summaries weekly"
-
-Or run `/customize` for guided changes.
-
-The codebase is small enough that Claude can safely modify it.
-
-## Contributing
-
-**Don't add features. Add skills.**
-
-If you want to add Telegram support, don't create a PR that adds Telegram alongside WhatsApp. Instead, contribute a skill file (`.claude/skills/add-telegram/SKILL.md`) that teaches Claude Code how to transform a NanoClaw installation to use Telegram.
-
-Users then run `/add-telegram` on their fork and get clean code that does exactly what they need, not a bloated system trying to support every use case.
-
-### RFS (Request for Skills)
-
-Skills we'd love to see:
-
-**Communication Channels**
-- `/add-telegram` - Add Telegram as channel. Should give the user option to replace WhatsApp or add as additional channel. Also should be possible to add it as a control channel (where it can trigger actions) or just a channel that can be used in actions triggered elsewhere
-- `/add-slack` - Add Slack
-- `/add-discord` - Add Discord
-
-**Platform Support**
-- `/setup-windows` - Windows via WSL2 + Docker
-
-**Session Management**
-- `/add-clear` - Add a `/clear` command that compacts the conversation (summarizes context while preserving critical information in the same session). Requires figuring out how to trigger compaction programmatically via the Claude Agent SDK.
-
-## Requirements
-
-- macOS or Linux
-- Node.js 20+
-- [Claude Code](https://claude.ai/download)
-- [Apple Container](https://github.com/apple/container) (macOS) or [Docker](https://docker.com/products/docker-desktop) (macOS/Linux)
-
-## Architecture
-
-```
-WhatsApp (baileys) --> SQLite --> Polling loop --> Container (Claude Agent SDK) --> Response
+一般問題 (DeepSeek V3)
+/x 敏感問題 (Grok，無審查)
+/draw 一隻貓咪 (中文自動轉英文 + 豐富)
+/gemini 長文檔分析
+發圖片 (自動 Vision)
 ```
 
-Single Node.js process. Agents execute in isolated Linux containers with mounted directories. IPC via filesystem. No daemons, no queues, no complexity.
+### 指令前綴
+- **預設** — DeepSeek V3
+- `/x` — Grok 4.1 Fast (無審查 + X 搜尋)
+- `/gemini` — Gemini 2.0 Flash (長文/vision)
+- `/deepseek` — 強制 DeepSeek
+- `/local` — Llama 3.2 3B (本地離線)
+- `/draw` — 直接生圖（中文 → 英文 + 豐富）
 
-Key files:
-- `src/index.ts` - Main app: WhatsApp connection, routing, IPC
-- `src/container-runner.ts` - Spawns agent containers
-- `src/task-scheduler.ts` - Runs scheduled tasks
-- `src/db.ts` - SQLite operations
-- `groups/*/CLAUDE.md` - Per-group memory
+### /draw 工作流
+```
+用戶: /draw 一隻坐在窗邊的可愛貓咪
+     ↓ enrichPrompt (DeepSeek 翻譯 + 豐富)
+系統: 📝 原始: 一隻坐在窗邊的可愛貓咪
+     ✨ 豐富後: A fluffy tabby cat sitting gracefully on a sunlit windowsill...
+     ↓ generate_image
+Bot:  [IMAGE] 生成完成 (Draw Things 本地 / HF FLUX.1-schnell)
+```
 
-## FAQ
+## 設定
 
-**Why WhatsApp and not Telegram/Signal/etc?**
+環境變數（.env）：
+```bash
+TELEGRAM_BOT_TOKEN=<from BotFather>
+DEEPSEEK_API_KEY=<from deepseek.com>
+OPENROUTER_API_KEY=<from openrouter.io>
+GEMINI_API_KEY=<from Google Cloud>
+HF_TOKEN=<from huggingface.co>
+```
 
-Because I use WhatsApp. Fork it and run a skill to change it. That's the whole point.
+## 常見問題
 
-**Why Apple Container instead of Docker?**
+**Q: 為什麼是 Telegram 而不是 WhatsApp？**
+A: 個人喜好。Fork 後改就行。
 
-On macOS, Apple Container is lightweight, fast, and optimized for Apple silicon. But Docker is also fully supported—during `/setup`, you can choose which runtime to use. On Linux, Docker is used automatically.
+**Q: 如何新增功能？**
+A: 直接改 src/ 裡的程式碼。小到可以安全修改。
 
-**Can I run this on Linux?**
+**Q: 如何除錯？**
+A: 監聽日誌：`tail -f /tmp/nanoclaw-live.log | grep -i "<keyword>"`
 
-Yes. Run `/setup` and it will automatically configure Docker as the container runtime. Thanks to [@dotsetgreg](https://github.com/dotsetgreg) for contributing the `/convert-to-docker` skill.
+**Q: 支援 Windows 嗎？**
+A: WSL2 + Docker 應該行。未測試。
 
-**Is this secure?**
+## 主要改進（2026-02-10）
 
-Agents run in containers, not behind application-level permission checks. They can only access explicitly mounted directories. You should still review what you're running, but the codebase is small enough that you actually can. See [docs/SECURITY.md](docs/SECURITY.md) for the full security model.
+### Gemini Vision
+- system instruction 改用正確 API 字段
+- 圖片優先級調整（提升辨識品質）
+- 詳細視覺提示詞
 
-**Why no configuration files?**
+### /draw 豐富化
+- 中文 → 英文自動翻譯
+- DeepSeek 提示詞豐富（風格/構圖/光線）
+- 顯示原始 + 最終提示詞
+- FLUX.1-schnell 敏感度提升
 
-We don't want configuration sprawl. Every user should customize it to so that the code matches exactly what they want rather than configuring a generic system. If you like having config files, tell Claude to add them.
+### 架構清理
+- 程式碼 5539 → 3997 行 (-28%)
+- 刪除 WhatsApp/容器/mount 死碼
+- 雙 backend 凍結其餘
 
-**How do I debug issues?**
+## 文件
 
-Ask Claude Code. "Why isn't the scheduler running?" "What's in the recent logs?" "Why did this message not get a response?" That's the AI-native approach.
-
-**Why isn't the setup working for me?**
-
-I don't know. Run `claude`, then run `/debug`. If claude finds an issue that is likely affecting other users, open a PR to modify the setup SKILL.md.
-
-**What changes will be accepted into the codebase?**
-
-Security fixes, bug fixes, and clear improvements to the base configuration. That's it.
-
-Everything else (new capabilities, OS compatibility, hardware support, enhancements) should be contributed as skills.
-
-This keeps the base system minimal and lets every user customize their installation without inheriting features they don't want.
+- `CLAUDE.md` — NanoClaw 系統指令 (Token 原則、互動規則、架構)
+- `groups/main/CLAUDE.md` — 群組記憶 + 系統指令
+- `Obsidian/Nano_Memories/` — 外部記憶庫 (CHANGELOG/SYSTEM_PRINCIPLES/COMMANDS)
 
 ## License
 

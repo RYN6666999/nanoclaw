@@ -1,0 +1,153 @@
+/**
+ * Image Generation Tool — uses HuggingFace Inference API (FLUX.1-schnell)
+ * Falls back to Draw Things local API if available.
+ * Returns a special marker [IMAGE:/path/to/file.png] for Telegram to send as photo.
+ */
+import fs from 'fs';
+import path from 'path';
+
+import type { Tool } from './index.js';
+
+const HF_API_URL = 'https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell';
+const DRAW_THINGS_URL = 'http://127.0.0.1:7860';
+const OUTPUT_DIR = '/tmp/nanoclaw-images';
+const TIMEOUT = 120000; // 2 minutes
+
+async function handler(args: Record<string, unknown>): Promise<string> {
+  const prompt = String(args.prompt || '');
+  if (!prompt) return 'Error: prompt is required';
+
+  const width = Number(args.width) || 1024;
+  const height = Number(args.height) || 1024;
+  const seed = args.seed ? Number(args.seed) : Math.floor(Math.random() * 2147483647);
+
+  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+  const filename = `gen-${Date.now()}.png`;
+  const outputPath = path.join(OUTPUT_DIR, filename);
+
+  // Try Draw Things local API first (free, no limits, uncensored)
+  try {
+    const dtResult = await tryDrawThings(prompt, width, height, seed, outputPath);
+    if (dtResult) return dtResult;
+  } catch {
+    // Fall through to HF API
+  }
+
+  // Fallback: HuggingFace Inference API
+  try {
+    return await tryHuggingFace(prompt, width, height, outputPath);
+  } catch (err) {
+    return `生圖失敗: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+async function tryDrawThings(
+  prompt: string,
+  width: number,
+  height: number,
+  seed: number,
+  outputPath: string,
+): Promise<string | null> {
+  // Check if Draw Things API is running
+  const healthCheck = await fetch(`${DRAW_THINGS_URL}/sdapi/v1/options`, {
+    signal: AbortSignal.timeout(2000),
+  }).catch(() => null);
+
+  if (!healthCheck?.ok) return null;
+
+  // Use Automatic1111-compatible API (Draw Things supports this)
+  const response = await fetch(`${DRAW_THINGS_URL}/sdapi/v1/txt2img`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      prompt,
+      width,
+      height,
+      seed,
+      steps: 20,
+      cfg_scale: 7,
+    }),
+    signal: AbortSignal.timeout(TIMEOUT),
+  });
+
+  if (!response.ok) return null;
+
+  const data = (await response.json()) as { images?: string[] };
+  if (!data.images?.[0]) return null;
+
+  // Save base64 image
+  const buffer = Buffer.from(data.images[0], 'base64');
+  fs.writeFileSync(outputPath, buffer);
+
+  return `[IMAGE:${outputPath}]\n生成完成 (Draw Things 本地, seed: ${seed})`;
+}
+
+async function tryHuggingFace(
+  prompt: string,
+  width: number,
+  height: number,
+  outputPath: string,
+): Promise<string> {
+  const hfToken = process.env.HF_TOKEN || process.env.HUGGINGFACE_TOKEN || '';
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (hfToken) {
+    headers['Authorization'] = `Bearer ${hfToken}`;
+  }
+
+  const response = await fetch(HF_API_URL, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      inputs: prompt,
+      parameters: { width, height },
+    }),
+    signal: AbortSignal.timeout(TIMEOUT),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`HuggingFace API ${response.status}: ${errText}`);
+  }
+
+  // Response is raw image bytes
+  const buffer = Buffer.from(await response.arrayBuffer());
+  fs.writeFileSync(outputPath, buffer);
+
+  return `[IMAGE:${outputPath}]\n生成完成 (FLUX.1-schnell)`;
+}
+
+export const generateImage: Tool = {
+  definition: {
+    type: 'function',
+    function: {
+      name: 'generate_image',
+      description: 'Generate an image from a text prompt. The prompt should be in English for best results. Returns the generated image to the chat.',
+      parameters: {
+        type: 'object',
+        properties: {
+          prompt: {
+            type: 'string',
+            description: 'Image generation prompt in English (e.g. "a beautiful sunset over mountains, photorealistic")',
+          },
+          width: {
+            type: 'number',
+            description: 'Image width in pixels (default: 1024)',
+          },
+          height: {
+            type: 'number',
+            description: 'Image height in pixels (default: 1024)',
+          },
+          seed: {
+            type: 'number',
+            description: 'Random seed for reproducibility (optional)',
+          },
+        },
+        required: ['prompt'],
+      },
+    },
+  },
+  handler,
+};

@@ -1,3 +1,47 @@
 {
-  "mcpServers": {}
+  "mcpServers": {
+    "filesystem": {
+      "command": "/opt/homebrew/bin/npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/Users/ryan/nanoclaw",
+        "/Users/ryan/Downloads",
+        "/Users/ryan/Desktop"
+      ]
+    },
+    "brave-search": {
+      "command": "/opt/homebrew/bin/npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-brave-search"
+      ],
+      "env": {
+        "BRAVE_API_KEY": "BSA_Fd5MV6SdToLe7A0EgkZmgcbRNvT"
+      }
+    },
+    "fetch": {
+      "command": "/opt/homebrew/bin/uvx",
+      "args": [
+        "mcp-server-fetch"
+      ]
+    },
+    "sequential-thinking": {
+      "command": "/opt/homebrew/bin/npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-sequential-thinking"
+      ]
+    },
+    "git": {
+      "command": "/opt/homebrew/bin/uvx",
+      "args": [
+        "mcp-server-git"
+      ]
+    },
+    "qmd": {
+      "command": "/Users/ryan/.bun/bin/qmd",
+      "args": ["mcp"]
+    }
+  }
 }

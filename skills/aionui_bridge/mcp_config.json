@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "nanoclaw-bridge": {
+      "command": "python3",
+      "args": [
+        "/Users/ryan/nanoclaw/skills/aionui_bridge/aionui_skill.py"
+      ],
+      "env": {
+        "PYTHONPATH": "/Users/ryan/nanoclaw/skills/aionui_bridge"
+      }
+    }
+  }
+}
