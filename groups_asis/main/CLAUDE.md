@@ -21,3 +21,39 @@
 ## 記憶系統
 - **Obsidian 永久記憶**：`~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/Nano_Memories/`
 - **對話歷史**：保留最近 20 輪對話。
+
+## 委派任務給 SeMeow
+
+作為主 Agent，可以透過 IPC 機制委派任務給 SeMeow（瑟喵）。
+
+**方法**：使用 bash 工具寫入 JSON 檔案到 SeMeow 的任務隊列。
+
+**步驟**：
+```bash
+# 1. 生成 timestamp
+TIMESTAMP=$(date +%s%N)
+
+# 2. 寫入任務 JSON
+cat > /Users/ryan/nanoclaw/data_SeMeow/ipc/SeMeow/tasks/${TIMESTAMP}.json << 'TASK'
+{
+  "type": "schedule_task",
+  "groupFolder": "SeMeow",
+  "prompt": "【具體指令】",
+  "schedule_type": "once",
+  "schedule_value": "2026-02-21T15:30:00Z",
+  "context_mode": "isolated"
+}
+TASK
+```
+
+**格式說明**：
+- `schedule_type`: "once" (一次) / "interval" (間隔) / "cron" (定時)
+- `schedule_value`: ISO timestamp / 毫秒數 / cron 表達式
+- `context_mode`: "isolated" (隔離上下文) / "group" (群組共用)
+
+**範例**：
+- 立即執行：`"schedule_type": "once", "schedule_value": "2026-02-21T14:00:00Z"`
+- 延遲 10 分鐘：`"schedule_type": "interval", "schedule_value": "600000"`
+- 每天 09:00：`"schedule_type": "cron", "schedule_value": "0 9 * * *"`
+
+**驗證**：SeMeow 在排定時間執行，並在 Telegram 回覆結果。
