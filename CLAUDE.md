@@ -43,7 +43,7 @@ Obsidian 為外部永久記憶庫。
 | `src/db.ts` | SQLite 訊息存儲 |
 | `src/task-scheduler.ts` | 排程任務（暫未用） |
 | `groups/{name}/CLAUDE.md` | 群組記憶 + 系統指令 |
-| `Obsidian/Nano_Memories/` | 外部記憶庫（真理源） |
+| `Obsidian/AI-work/Nano_Memories/` | 外部記憶庫（真理源） |
 
 ## 系統架構
 
@@ -118,7 +118,7 @@ Result: [IMAGE] seed: 12345...
 
 ## Obsidian 記憶
 
-**真理源**：`~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/Nano_Memories/`
+**真理源**：`~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/AI-work/Nano_Memories/`
 
 必須同步檔案：
 - `SYSTEM_PRINCIPLES.md` — 架構 + 路由決策 + 工具配置

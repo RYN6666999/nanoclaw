@@ -108,7 +108,7 @@ async function logCrashToObsidian(restartCount: number): Promise<void> {
     const crashLog = `[${new Date().toISOString()}] Bot reconnection attempt #${restartCount}`
     const changelogPath = path.join(
       os.homedir(),
-      'Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/Nano_Memories/CHANGELOG.md'
+      'Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/AI-work/Nano_Memories/CHANGELOG.md'
     )
     const content = fs.readFileSync(changelogPath, 'utf-8')
     const lines = content.split('\n')

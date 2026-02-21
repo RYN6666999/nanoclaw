@@ -19,7 +19,7 @@
 | **bash** | 系統命令 | 執行必要腳本 |
 
 ## 記憶系統
-- **Obsidian 永久記憶**：`~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/Nano_Memories/`
+- **Obsidian 永久記憶**：`~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/AI-work/Nano_Memories/`
 - **對話歷史**：保留最近 20 輪對話。
 
 ## 委派任務給 SeMeow
