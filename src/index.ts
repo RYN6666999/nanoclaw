@@ -450,7 +450,14 @@ async function main(): Promise<void> {
 
   await ensureBackendsAvailable();
   initDatabase();
-  startHeartbeat();
+  startHeartbeat(async (text) => {
+    const mainEntry = Object.entries(registeredGroups).find(
+      ([, g]) => g.folder === MAIN_GROUP_FOLDER
+    );
+    if (mainEntry) {
+      await sendMessage(mainEntry[0], text);
+    }
+  });
   logger.info(
     {
       envFile: process.env.ENV_FILE || '.env',
