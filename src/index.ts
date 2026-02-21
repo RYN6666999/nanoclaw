@@ -14,6 +14,7 @@ import { ensureBackendsAvailable, runHostAgent } from './host-agent.js';
 import { initDatabase } from './db.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { startHeartbeat, heartbeatRecordConversation } from './heartbeat.js';
+import { startDecisionAgent } from './decision-agent.js';
 import { RegisteredGroup, Session } from './types.js';
 import { loadJson, saveJson } from './utils.js';
 import { logger } from './logger.js';
@@ -451,6 +452,16 @@ async function main(): Promise<void> {
   await ensureBackendsAvailable();
   initDatabase();
   startHeartbeat(async (text) => {
+    const mainEntry = Object.entries(registeredGroups).find(
+      ([, g]) => g.folder === MAIN_GROUP_FOLDER
+    );
+    if (mainEntry) {
+      await sendMessage(mainEntry[0], text);
+    }
+  });
+
+  // Start decision agent (15-min loop for autonomous goal tracking)
+  startDecisionAgent(async (text) => {
     const mainEntry = Object.entries(registeredGroups).find(
       ([, g]) => g.folder === MAIN_GROUP_FOLDER
     );
