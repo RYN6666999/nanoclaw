@@ -31,6 +31,7 @@ import {
   autoAppendActivityLog,
   updateWakeNow,
   appendConversationLog,
+  appendLessonLearned,
   distillMemoryIfNeeded,
 } from './obsidian-integration.js';
 import { RegisteredGroup } from './types.js';
@@ -547,6 +548,7 @@ export async function runHostAgent(
   );
 
   if (output.status === 'error') {
+    let firstError = output.error;
     for (const fb of getFallbackChain(usedBackend)) {
       usedBackend = fb.backend;
       usedModel = fb.model;
@@ -558,6 +560,13 @@ export async function runHostAgent(
         input,
       );
       if (output.status === 'success') break;
+      // Record repeatable system errors (not user input problems)
+      const isApiError = /^(OpenRouter|Gemini|API|Error:|Unknown)/.test(output.error || '');
+      if (isApiError && output.error) {
+        appendLessonLearned(
+          `fallback ${usedBackend} failed: ${(output.error || '').slice(0, 80)}`
+        );
+      }
     }
   }
 

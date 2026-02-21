@@ -69,13 +69,7 @@ export function writeObsidianContext(context: string): void {
 
     // Write with timestamp
     const timestamp = new Date().toISOString();
-    const content = `# Nano Claw Context (${timestamp})
-
-${context}
-
----
-Last updated: ${timestamp}
-`;
+    const content = `# Nano Claw Context (${timestamp})\n\n${context}\n\n---\nLast updated: ${timestamp}\n`;
 
     fs.writeFileSync(OBSIDIAN_CURRENT_CONTEXT, content, 'utf-8');
     logger.debug({ size: context.length }, 'Wrote Obsidian context');
@@ -137,6 +131,61 @@ export function autoAppendActivityLog(
     fs.appendFileSync(OBSIDIAN_CURRENT_CONTEXT, line, 'utf-8');
   } catch {
     // non-critical, silent fail
+  }
+}
+
+/**
+ * Append a lesson learned entry to WAKE.md's "踩坑記錄" section.
+ * If section doesn't exist, creates it at the end of the file.
+ * Format: - YYYY-MM-DD: {lesson}
+ * Keeps only the last 10 entries, deletes older ones.
+ */
+export function appendLessonLearned(lesson: string): void {
+  try {
+    const wakePath = path.join(OBSIDIAN_MEMORY_DIR, WAKE_FILE);
+    if (!fs.existsSync(wakePath)) return;
+
+    let content = fs.readFileSync(wakePath, 'utf-8');
+    const today = new Date().toISOString().slice(0, 10);
+    const entry = `- ${today}: ${lesson}`;
+
+    // Check if "## ⑤ 踩坑記錄" section exists
+    const sectionMatch = content.match(/## ⑤[^\n]*踩坑記錄[^\n]*\n/);
+    if (sectionMatch) {
+      // Section exists — find the section and append
+      const sectionStart = content.indexOf(sectionMatch[0]) + sectionMatch[0].length;
+      const nextSectionMatch = content.slice(sectionStart).match(/\n## [⑥⑦⑧⑨⑩]/);
+      const sectionEnd = nextSectionMatch
+        ? sectionStart + nextSectionMatch.index!
+        : content.length;
+
+      const sectionContent = content.slice(sectionStart, sectionEnd);
+      const lines = sectionContent
+        .split('\n')
+        .filter((l) => l.trim().startsWith('- ') && l.includes(':'));
+
+      // Keep only last 9 entries (so we can add 1 more for 10 total)
+      const recentLines = lines.slice(-9);
+      recentLines.push(entry);
+
+      const newSectionContent = recentLines.join('\n') + '\n';
+      content =
+        content.slice(0, sectionStart) +
+        newSectionContent +
+        content.slice(sectionEnd);
+    } else {
+      // Section doesn't exist — create it at the end
+      const sectionText = `\n## ⑤ 踩坑記錄\n\n${entry}\n`;
+      content += sectionText;
+    }
+
+    fs.writeFileSync(wakePath, content, 'utf-8');
+    logger.debug({ lesson }, 'Appended lesson learned to WAKE.md');
+  } catch (err) {
+    logger.warn(
+      { error: err instanceof Error ? err.message : String(err) },
+      'Failed to append lesson learned',
+    );
   }
 }
 
