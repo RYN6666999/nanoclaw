@@ -121,6 +121,9 @@ function writeHeartbeat(): void {
 
       // Detect anomalies
       detectAnomalies(botProcs);
+
+      // Check daily goals (runs once per day at 09:00)
+      checkGoals();
     } catch {
       // non-critical
     }
@@ -203,4 +206,60 @@ export function startHeartbeat(
   writeHeartbeat();
   setInterval(writeHeartbeat, HEARTBEAT_INTERVAL_MS);
   logger.info({ intervalMin: 30 }, 'Heartbeat started');
+}
+
+let lastGoalCheckDate: string | null = null;
+
+/**
+ * Check long-term goals from WAKE.md and send reminders.
+ * Called once per day at 09:00 (or on first heartbeat if after 09:00).
+ */
+function checkGoals(): void {
+  if (!sendAlertCallback) return;
+
+  try {
+    const now = new Date();
+    const today = now.toISOString().slice(0, 10);
+    const hour = now.getHours();
+
+    // Only check once per day and after 09:00
+    if (lastGoalCheckDate === today || hour < 9) return;
+    lastGoalCheckDate = today;
+
+    const wakePath = path.join(OBSIDIAN_MEMORY_DIR, 'WAKE.md');
+    if (!fs.existsSync(wakePath)) return;
+
+    const wakeContent = fs.readFileSync(wakePath, 'utf-8');
+    // Extract ⑥ 長期目標 section
+    const sectionMatch = wakeContent.match(/## ⑥[^\n]*目標[^\n]*\n([\s\S]*?)(?=\n## ⑦|---|\n$)/);
+    if (!sectionMatch) return;
+
+    const goalsSection = sectionMatch[1];
+    const lines = goalsSection.split('\n').filter((l) => l.match(/^- \[[\sx]\]/));
+
+    // Find uncompleted goals with deadline <= today + 3 days
+    const upcomingGoals = lines
+      .filter((l) => l.includes('[ ]') && l.includes('截止:'))
+      .filter((l) => {
+        const dateMatch = l.match(/截止:\s*(\d{4}-\d{2}-\d{2})/);
+        if (!dateMatch) return false;
+        const deadline = new Date(dateMatch[1]);
+        const inThreeDays = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
+        return deadline <= inThreeDays;
+      });
+
+    if (upcomingGoals.length > 0) {
+      const goalList = upcomingGoals
+        .map((l) => `  • ${l.slice(6).trim()}`)
+        .join('\n');
+      sendAlertCallback(
+        `📋 [Heartbeat] 即將到期的目標\n\n${goalList}\n\n請在 WAKE.md 更新進度`,
+      ).catch((err) => {
+        logger.warn({ err }, 'Failed to send goal alert');
+      });
+    }
+  } catch (err) {
+    logger.warn({ error: err instanceof Error ? err.message : String(err) },
+      'Failed to check goals');
+  }
 }
