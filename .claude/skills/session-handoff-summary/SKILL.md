@@ -522,7 +522,53 @@ cat "/Users/ryan/Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/AI-wo
 1. 用戶說「開新對話」時自動啟動
 2. 生成交接摘要 + 提示詞
 3. 保存到 Obsidian
-4. 返回可複製的提示詞
-5. 用戶新窗口粘上提示詞 → 無縫繼續
+4. **同步更新 `update_present`**（見下方規則）
+5. 返回可複製的提示詞
+6. 用戶新窗口粘上提示詞 → 無縫繼續
 
 🎯 目標達成：**AI 甦醒時不再茫然無知**
+
+---
+
+## update_present 同步規則
+
+**每次** session-handoff-summary 觸發時，必須同步覆寫以下檔案：
+
+```
+/Users/ryan/Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/AI-work/_GUIDE/update_present/NANOCLAW_STATUS.md
+```
+
+### 流程
+1. 用 `date '+%Y-%m-%d %H:%M'` 取得**實際時間**（禁止從檔名或記憶推斷）
+2. 採集指標：tsc errors / jest results / `any` count / git commit
+3. 覆寫 `NANOCLAW_STATUS.md`（不累積，永遠只保最新）
+
+### 模板
+```markdown
+# NanoClaw 最新狀態
+> 自動更新於 {date 指令輸出}
+
+## 指標
+| 項目 | 數值 |
+|------|------|
+| tsc errors | {npx tsc --noEmit 結果} |
+| jest suites | N/N |
+| jest tests | N/N |
+| any 殘留 | {grep 結果} |
+| git commit | {git log --oneline -1} |
+| git branch | {git branch --show-current} |
+
+## 當前階段
+{簡述}
+
+## 待辦
+- [ ] ...
+
+## 最近完成
+- [x] ...
+```
+
+### 注意
+- 路徑含空格，shell 指令須引號包裹
+- 此檔經 iCloud 同步到所有裝置
+- 規則詳見 `update_present/README.md`
