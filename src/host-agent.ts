@@ -31,8 +31,14 @@ import {
   readWakeFile,
   autoAppendActivityLog,
 } from './obsidian-integration.js';
-import { RegisteredGroup } from './types.js';
+import { RegisteredGroup, HandoffSummary } from './types.js';
 import { LoadBalancer } from './backend-metrics.js';
+
+/** Type for dynamically imported handoff skill module */
+interface HandoffModule {
+  generateHandoffSummary(title: string, messages: string[], meta: { changedFilesList?: string[] }): Promise<HandoffSummary>;
+  matchesTrigger?(text: string): boolean;
+}
 
 const requestQueue: Array<() => void> = [];
 let lastRequestTime = 0;
@@ -398,8 +404,12 @@ async function runOpenRouter(
         finalResult = streamedContent;
         break;
       } else {
-        const data = await response.json();
+        const data = (await response.json()) as { choices?: { message: { content?: string; tool_calls?: { id: string; function: { name: string; arguments: string } }[] } }[] };
         const msg = data.choices?.[0]?.message;
+        if (!msg) {
+          finalResult = '[No response from model]';
+          break;
+        }
         if (msg.tool_calls) {
           messages.push(msg);
           for (const tc of msg.tool_calls) {
@@ -415,7 +425,7 @@ async function runOpenRouter(
           }
           continue;
         }
-        finalResult = msg.content;
+        finalResult = msg.content ?? '';
         break;
       }
     }
@@ -447,7 +457,7 @@ async function runGemini(
       },
     );
     if (!response.ok) throw new Error(`Gemini Error: ${response.status}`);
-    const data = await response.json();
+    const data = (await response.json()) as { candidates?: { content: { parts: { text: string }[] } }[] };
     const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
     return { status: 'success', result: cleanModelOutput(text) };
   } catch (err) {
@@ -482,7 +492,7 @@ async function runGeminiVision(
         }),
       },
     );
-    const data = await response.json();
+    const data = (await response.json()) as { candidates?: { content: { parts: { text: string }[] } }[] };
     const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
     return { status: 'success', result: text };
   } catch (err) {
@@ -613,7 +623,8 @@ export async function runHostAgent(
     // 非同步：檢查是否需要產生 session handoff summary
     (async () => {
       try {
-        const handoffModule = await import('../skills/session-handoff-summary/skill.js');
+        const handoffPath = '../skills/session-handoff-summary/skill.js';
+        const handoffModule = (await import(handoffPath)) as HandoffModule;
         const lastTexts: string[] = history
           .slice(-6)
           .map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)))
@@ -641,16 +652,16 @@ export async function runHostAgent(
             changedFilesList = [];
           }
 
-          const summary = await handoffModule.generateHandoffSummary({
-            title: `Handoff - ${input.groupFolder}`,
-            messages: lastTexts,
-            meta: { changedFiles: changedFilesList.length, changedFilesList },
-          });
+          const summary = await handoffModule.generateHandoffSummary(
+            `Handoff - ${input.groupFolder}`,
+            lastTexts,
+            { changedFilesList },
+          );
           logger.info({ summary }, 'Session handoff generated (non-blocking)');
           
           // Send the summary back to Telegram if possible
           try {
-            const { sendTelegramMessage } = await import('./telegram.js');
+            const { sendTelegramMessage } = await import('./telegram/index.js');
             const groupsRaw = fs.readFileSync(path.join(DATA_DIR, 'registered_groups.json'), 'utf-8');
             const groups: Record<string, RegisteredGroup> = JSON.parse(groupsRaw);
             const chatJid = Object.keys(groups).find(k => groups[k].folder === input.groupFolder);
@@ -745,7 +756,7 @@ export async function ensureBackendsAvailable(): Promise<void> {
 }
 
 // Manual handoff trigger: generate summary for a group on demand
-export async function triggerHandoffForGroup(groupFolder: string) {
+export async function triggerHandoffForGroup(groupFolder: string): Promise<HandoffSummary> {
   const key = `openrouter_${groupFolder}`;
   const history = conversationHistory[key] || [];
   const lastTexts: string[] = history
@@ -754,7 +765,8 @@ export async function triggerHandoffForGroup(groupFolder: string) {
     .filter(Boolean);
 
   try {
-    const handoffModule = await import('../skills/session-handoff-summary/skill.js');
+    const handoffPath = '../skills/session-handoff-summary/skill.js';
+    const handoffModule = (await import(handoffPath)) as HandoffModule;
 
     // detect git changed files
     let changedFilesList: string[] = [];
@@ -770,11 +782,11 @@ export async function triggerHandoffForGroup(groupFolder: string) {
         .filter((p) => (groupFolder ? p.startsWith(groupFolder) : true));
     } catch {}
 
-    const summary = await handoffModule.generateHandoffSummary({
-      title: `Handoff - ${groupFolder}`,
-      messages: lastTexts,
-      meta: { changedFiles: changedFilesList.length, changedFilesList },
-    });
+    const summary = await handoffModule.generateHandoffSummary(
+      `Handoff - ${groupFolder}`,
+      lastTexts,
+      { changedFilesList },
+    );
 
     // persist suggestion
     try {

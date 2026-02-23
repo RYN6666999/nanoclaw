@@ -1,0 +1,33 @@
+{
+  "name": "nanoclaw-model-usage",
+  "displayName": "NanoClaw Model Usage",
+  "description": "Lightweight VS Code extension to observe model usage from local NanoClaw logs and config.",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:nanoclawModelUsage.openView"
+  ],
+  "main": "./out/extension.js",
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.80.0",
+    "vscode": "^1.1.59"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "nanoclawModelUsage.openView",
+        "title": "NanoClaw: Open Model Usage"
+      }
+    ]
+  }
+}

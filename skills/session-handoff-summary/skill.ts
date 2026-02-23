@@ -44,7 +44,7 @@ interface HandoffResult {
 }
 
 // 2. 乾淨、功能完整的核心函式
-async function generateHandoffSummary(
+export async function generateHandoffSummary(
   title: string,
   messages: string[],
   meta: { changedFilesList?: string[] }
@@ -121,7 +121,7 @@ ${messages.map(m => `- "${m}"`).join('\n')}
     throw new Error(`API 請求失敗，狀態碼 ${response.status}：${errorBody}`);
   }
 
-  const data = await response.json();
+  const data = (await response.json()) as { candidates?: { content: { parts: { text: string }[] } }[] };
   
   if (!data.candidates || !data.candidates[0].content.parts[0].text) {
     console.error('API 回應結構異常：', JSON.stringify(data, null, 2));
@@ -130,6 +130,13 @@ ${messages.map(m => `- "${m}"`).join('\n')}
 
   const resultText = data.candidates[0].content.parts[0].text;
   return JSON.parse(resultText) as HandoffResult;
+}
+
+/** 檢查對話是否觸發 handoff（關鍵字匹配） */
+export function matchesTrigger(text: string): boolean {
+  const triggers = ['handoff', '交接', '交班', '結束對話', 'session end', '收工'];
+  const lower = text.toLowerCase();
+  return triggers.some(t => lower.includes(t));
 }
 
 // 5. 穩定的命令列執行包裝器

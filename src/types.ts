@@ -77,3 +77,17 @@ export interface TaskRunLog {
   result: string | null;
   error: string | null;
 }
+
+/** Session handoff summary returned by the handoff skill */
+export interface HandoffSummary {
+  title?: string;
+  summary?: string;
+  priority?: string;
+  userPreferences?: string[];
+  pitfalls?: { description: string; solution: string }[];
+  goalAlignment?: { progress: string; assessment: string };
+  commitSuggestion?: { shouldCommit: boolean; message: string };
+  obsidianLog?: string;
+  nextSessionPrompt?: string;
+  changedFilesList?: string[];
+}

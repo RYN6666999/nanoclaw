@@ -18,7 +18,7 @@ import { getMessageById, getMessagesSince, storeTelegramMessage } from './db.js'
 import { logger } from './logger.js';
 import { getToolHandler } from './tools/index.js';
 import { storePendingImage } from './tools/vision.js';
-import { RegisteredGroup } from './types.js';
+import { RegisteredGroup, HandoffSummary } from './types.js';
 
 const TG_JID_PREFIX = 'tg:';
 
@@ -181,8 +181,10 @@ export async function connectTelegram(
       return;
     }
 
+    const chatJid = makeTelegramJid(msg.chat.id);
+
     // /handoff command — manually trigger session handoff summary
-    if (msg.text === '/handoff' || msg.text.startsWith('/handoff ')) {
+    if (msg.text === '/handoff' || (msg.text && msg.text.startsWith('/handoff '))) {
       await ctx.replyWithChatAction('typing');
       try {
         const registeredGroups = config.getRegisteredGroups();
@@ -232,7 +234,6 @@ export async function connectTelegram(
       return;
     }
 
-    const chatJid = makeTelegramJid(msg.chat.id);
     const timestamp = new Date(msg.date * 1000).toISOString();
     const senderName = msg.author_signature || 'Channel';
     const sender = String(msg.chat.id);
@@ -1230,16 +1231,13 @@ export function createTelegramStream(
     try {
       await botRef.api.editMessageText(chatId, messageId, html, {
         parse_mode: 'HTML',
-        reply_markup: replyMarkup,
       });
       lastEditTime = Date.now();
     } catch (err) {
       // If HTML fails, try plain text
       if (err instanceof GrammyError && err.error_code === 400) {
         try {
-          await botRef.api.editMessageText(chatId, messageId, buffer, {
-            reply_markup: replyMarkup,
-          });
+          await botRef.api.editMessageText(chatId, messageId, buffer);
           lastEditTime = Date.now();
         } catch {
           // Ignore edit failures during streaming

@@ -25,7 +25,7 @@ import {
   getTelegramChatId,
   isTelegramJid,
   sendTelegramMessage,
-} from './telegram.js';
+} from './telegram/index.js';
 import { startHealthMonitor } from './health-monitor.js';
 
 let sessions: Session = {};

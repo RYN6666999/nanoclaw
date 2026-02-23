@@ -26,19 +26,19 @@ export function checkDuplicateInstance(botToken: string): void {
     })
 
     if (otherInstances.length > 0) {
-      logger.warn('⚠️  Detected potential duplicate bot instance', {
+      logger.warn({
         currentPid,
         otherInstances: otherInstances.length,
         botId
-      })
+      }, '⚠️  Detected potential duplicate bot instance')
 
       // 不強制退出，只警告（PM2 會管理多實例）
       // 但如果是手動啟動，應該先停掉其他實例
     }
 
-    logger.info('Process guard check passed', { botId, currentPid })
+    logger.info({ botId, currentPid }, 'Process guard check passed')
   } catch (err) {
-    logger.error('Process guard check failed', { err })
+    logger.error({ err }, 'Process guard check failed')
   }
 }
 
@@ -55,9 +55,9 @@ export async function clearWebhookOnStartup(botToken: string): Promise<void> {
     if (data.ok) {
       logger.info('Webhook cleared successfully on startup')
     } else {
-      logger.warn('Failed to clear webhook', { description: data.description })
+      logger.warn({ description: data.description }, 'Failed to clear webhook')
     }
   } catch (err) {
-    logger.error('Error clearing webhook', { err })
+    logger.error({ err }, 'Error clearing webhook')
   }
 }

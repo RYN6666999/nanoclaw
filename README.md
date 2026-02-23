@@ -114,6 +114,24 @@ OPENROUTER_API_KEY=<from openrouter.io>
 HF_TOKEN=<from huggingface.co>
 ```
 
+自動交接與自動 commit（選用）:
+
+- `AUTO_COMMIT_ENABLED`：設為 `true` 可允許系統在偵測到里程碑時自動執行 `git commit`（預設 `false`）。建議先使用 dry-run 測試：
+
+```bash
+npx tsx scripts/auto-commit-sim.ts
+```
+
+要實際套用 commit：
+
+```bash
+export AUTO_COMMIT_ENABLED=true
+npx tsx scripts/auto-commit-sim.ts --apply
+```
+
+此功能會在 `logs/handoff_suggestions.json` 儲存 handoff 建議，summary 會包含 `changedFilesList`（由 `git status --porcelain` 取得，若可用）。
+
+
 ## 常見問題
 
 **Q: 為什麼是 Telegram 而不是 WhatsApp？**
