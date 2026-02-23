@@ -106,7 +106,7 @@ async function logCrashToObsidian(restartCount: number): Promise<void> {
     const path = await import('path')
     const os = await import('os')
     const crashLog = `[${new Date().toISOString()}] Bot reconnection attempt #${restartCount}`
-    const changelogPath = path.join(
+    const changelogPath = process.env.OBSIDIAN_TIMELINE_PATH || path.join(
       os.homedir(),
       'Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/AI-work/hermes_memories/TIMELINE.md'
     )

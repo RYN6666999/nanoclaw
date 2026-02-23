@@ -8,6 +8,7 @@ import path from 'path';
 import {
   AGENT_TIMEOUT,
   ASSISTANT_NAME,
+  DATA_DIR,
   GEMINI_API_KEY,
   GEMINI_MODEL,
   GROUPS_DIR,
@@ -37,11 +38,15 @@ const requestQueue: Array<() => void> = [];
 let lastRequestTime = 0;
 const MIN_REQUEST_INTERVAL = 1000;
 
+const MAX_RETRIES = 3;
+
 async function rateLimitedFetch(
   url: string,
   options: RequestInit,
 ): Promise<Response> {
   return new Promise((resolve, reject) => {
+    let retryCount = 0;
+
     const attempt = async () => {
       const now = Date.now();
       const timeSinceLastRequest = now - lastRequestTime;
@@ -57,11 +62,16 @@ async function rateLimitedFetch(
         const response = await fetch(url, options);
 
         if (response.status === 429) {
+          retryCount++;
+          if (retryCount > MAX_RETRIES) {
+            reject(new Error(`API 持續回傳 429，已重試 ${MAX_RETRIES} 次仍失敗`));
+            return;
+          }
           const retryAfter = parseInt(
             response.headers.get('retry-after') || '2000',
             10,
           );
-          logger.warn({ retryAfter }, 'Rate limited, waiting...');
+          logger.warn({ retryAfter, retryCount, maxRetries: MAX_RETRIES }, 'Rate limited, waiting...');
           await new Promise((r) => setTimeout(r, retryAfter));
 
           if (requestQueue.length > 0) {
@@ -74,8 +84,10 @@ async function rateLimitedFetch(
         }
 
         resolve(response);
-      } catch (err: any) {
-        logger.error({ url, error: String(err), stack: err.stack }, 'Fetch failed');
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        const errStack = err instanceof Error ? err.stack : undefined;
+        logger.error({ url, error: errMsg, stack: errStack }, 'Fetch failed');
         reject(err);
       }
     };
@@ -598,6 +610,90 @@ export async function runHostAgent(
   if (output.status === 'success' && !input.isScheduledTask) {
     const history = conversationHistory[`openrouter_${input.groupFolder}`] || [];
 
+    // 非同步：檢查是否需要產生 session handoff summary
+    (async () => {
+      try {
+        const handoffModule = await import('../skills/session-handoff-summary/skill.js');
+        const lastTexts: string[] = history
+          .slice(-6)
+          .map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)))
+          .filter(Boolean);
+        const combined = lastTexts.join('\n');
+        const triggered = handoffModule.matchesTrigger
+          ? handoffModule.matchesTrigger(combined)
+          : false;
+
+        if (triggered) {
+          // detect git changed files (non-blocking best-effort)
+          let changedFilesList: string[] = [];
+          try {
+            const { execSync } = await import('child_process');
+            const gitOut = String(execSync('git status --porcelain', { stdio: ['ignore', 'pipe', 'ignore'] }));
+            changedFilesList = gitOut
+              .split('\n')
+              .map((l) => l.trim())
+              .filter(Boolean)
+              .map((l) => l.replace(/^\S+\s+/, '').trim())
+              .filter((p) => p.length > 0)
+              .filter((p) => (input.groupFolder ? p.startsWith(input.groupFolder) : true));
+          } catch (e) {
+            // ignore git errors
+            changedFilesList = [];
+          }
+
+          const summary = await handoffModule.generateHandoffSummary({
+            title: `Handoff - ${input.groupFolder}`,
+            messages: lastTexts,
+            meta: { changedFiles: changedFilesList.length, changedFilesList },
+          });
+          logger.info({ summary }, 'Session handoff generated (non-blocking)');
+          
+          // Send the summary back to Telegram if possible
+          try {
+            const { sendTelegramMessage } = await import('./telegram.js');
+            const groupsRaw = fs.readFileSync(path.join(DATA_DIR, 'registered_groups.json'), 'utf-8');
+            const groups: Record<string, RegisteredGroup> = JSON.parse(groupsRaw);
+            const chatJid = Object.keys(groups).find(k => groups[k].folder === input.groupFolder);
+            if (chatJid) {
+              const chatId = parseInt(chatJid.split('@')[0], 10);
+              const lines: string[] = [];
+              lines.push(`**自動 Handoff 建議 - ${input.groupFolder}**`);
+              lines.push(`優先度：${summary.priority}`);
+              if (summary.summary) lines.push(`\n**承先啟後脈絡提示詞：**\n${summary.summary}`);
+              if (summary.obsidianLog) lines.push(`\n**已同步至 Obsidian：**\n${summary.obsidianLog}`);
+              if (summary.changedFilesList && summary.changedFilesList.length) {
+                lines.push('\n**變更檔案：**');
+                lines.push(summary.changedFilesList.slice(0, 20).join('\n'));
+              }
+              if (summary.commitSuggestion && summary.commitSuggestion.shouldCommit) {
+                lines.push(`\n**建議 commit:** ${summary.commitSuggestion.message}`);
+              } else {
+                lines.push('\n無自動 commit 建議');
+              }
+              await sendTelegramMessage(chatId, lines.join('\n'));
+            }
+          } catch (e) {
+            logger.warn({ error: String(e) }, 'Failed to send auto handoff to Telegram');
+          }
+
+          try {
+            const outPath = path.join(process.cwd(), 'logs', 'handoff_suggestions.json');
+            const obj = { time: new Date().toISOString(), group: input.groupFolder, summary };
+            let arr = [] as any[];
+            try {
+              const raw = fs.readFileSync(outPath, 'utf-8');
+              arr = JSON.parse(raw || '[]');
+            } catch {}
+            arr.push(obj);
+            fs.writeFileSync(outPath, JSON.stringify(arr, null, 2));
+          } catch (e) {
+            logger.warn({ error: String(e) }, 'Failed to persist handoff suggestion');
+          }
+        }
+      } catch (e) {
+        logger.warn({ error: String(e) }, 'Handoff module check failed');
+      }
+    })();
 
  
   }
@@ -646,4 +742,55 @@ export async function ensureBackendsAvailable(): Promise<void> {
   initializeObsidianMemory();
 
  
+}
+
+// Manual handoff trigger: generate summary for a group on demand
+export async function triggerHandoffForGroup(groupFolder: string) {
+  const key = `openrouter_${groupFolder}`;
+  const history = conversationHistory[key] || [];
+  const lastTexts: string[] = history
+    .slice(-20)
+    .map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)))
+    .filter(Boolean);
+
+  try {
+    const handoffModule = await import('../skills/session-handoff-summary/skill.js');
+
+    // detect git changed files
+    let changedFilesList: string[] = [];
+    try {
+      const { execSync } = await import('child_process');
+      const gitOut = String(execSync('git status --porcelain', { stdio: ['ignore', 'pipe', 'ignore'] }));
+      changedFilesList = gitOut
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .map((l) => l.replace(/^\S+\s+/, '').trim())
+        .filter((p) => p.length > 0)
+        .filter((p) => (groupFolder ? p.startsWith(groupFolder) : true));
+    } catch {}
+
+    const summary = await handoffModule.generateHandoffSummary({
+      title: `Handoff - ${groupFolder}`,
+      messages: lastTexts,
+      meta: { changedFiles: changedFilesList.length, changedFilesList },
+    });
+
+    // persist suggestion
+    try {
+      const outPath = path.join(process.cwd(), 'logs', 'handoff_suggestions.json');
+      const obj = { time: new Date().toISOString(), group: groupFolder, summary };
+      let arr = [] as any[];
+      try {
+        const raw = fs.readFileSync(outPath, 'utf-8');
+        arr = JSON.parse(raw || '[]');
+      } catch {}
+      arr.push(obj);
+      fs.writeFileSync(outPath, JSON.stringify(arr, null, 2));
+    } catch {}
+
+    return summary;
+  } catch (e) {
+    throw e;
+  }
 }

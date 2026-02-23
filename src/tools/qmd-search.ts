@@ -5,7 +5,7 @@
 import { exec } from 'child_process';
 import type { Tool } from './index.js';
 
-const QMD_BIN = '/Users/ryan/.bun/bin/qmd';
+const QMD_BIN = process.env.QMD_BIN || 'qmd';
 const TIMEOUT = 20000; // 20s
 const MAX_OUTPUT = 3000;
 

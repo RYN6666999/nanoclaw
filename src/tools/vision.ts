@@ -67,7 +67,7 @@ export function isDocumentImage(prompt: string): boolean {
   return DOC_KEYWORDS.some((kw) => lowerPrompt.includes(kw.toLowerCase()));
 }
 
-const PADDLE_PYTHON = '/opt/anaconda3/bin/python';
+const PADDLE_PYTHON = process.env.PADDLE_PYTHON || 'python3';
 const PADDLE_SCRIPT = `
 import os, sys, json, time
 os.environ['PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK'] = 'True'

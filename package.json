@@ -17,20 +17,16 @@
     "test:coverage": "jest --config jest.final.cjs --coverage"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "better-sqlite3": "^11.8.1",
     "cron-parser": "^5.5.0",
     "grammy": "^1.39.3",
     "pino": "^9.6.0",
-    "pino-pretty": "^13.0.0",
-    "qrcode-terminal": "^0.12.0",
-    "zod": "^4.3.6"
+    "pino-pretty": "^13.0.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/jest": "^30.0.0",
     "@types/node": "^22.10.0",
-    "@types/qrcode-terminal": "^0.12.2",
     "jest": "^30.2.0",
     "prettier": "^3.8.1",
     "ts-jest": "^29.4.6",
