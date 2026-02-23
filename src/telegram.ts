@@ -12,7 +12,7 @@ import {
   OPENROUTER_API_KEY,
   SE_MEOW_BOX_CHANNEL_ID,
 } from './config.js';
-import { getMessagesSince, storeTelegramMessage } from './db.js';
+import { getMessageById, getMessagesSince, storeTelegramMessage } from './db.js';
 import { logger } from './logger.js';
 import { getToolHandler } from './tools/index.js';
 import { storePendingImage } from './tools/vision.js';
@@ -138,6 +138,7 @@ export async function connectTelegram(
   bot.catch((err) => {
     const ctx = err.ctx;
     const e = err.error;
+    logger.error({ err: e, ctx }, 'Error caught by grammY');
 
     if (e instanceof GrammyError) {
       logger.error(
@@ -151,6 +152,122 @@ export async function connectTelegram(
         { err: e, updateId: ctx?.update?.update_id },
         'Telegram handler error',
       );
+    }
+  });
+
+  // Handle channel posts
+  bot.on('channel_post', async (ctx) => {
+    logger.info({ channelPost: ctx.channelPost }, 'Received channel_post event');
+    const msg = ctx.channelPost;
+    if (msg.chat.id !== SE_MEOW_BOX_CHANNEL_ID) {
+      return;
+    }
+
+    const chatJid = makeTelegramJid(msg.chat.id);
+    const timestamp = new Date(msg.date * 1000).toISOString();
+    const senderName = msg.author_signature || 'Channel';
+    const sender = String(msg.chat.id);
+    const content = msg.text || msg.caption || '[Unsupported Message Type]';
+
+    storeTelegramMessage(
+      String(msg.message_id),
+      chatJid,
+      sender,
+      senderName,
+      content,
+      timestamp,
+      false,
+    );
+
+    logger.info(
+      { channelId: msg.chat.id, messageId: msg.message_id },
+      'Stored channel post from SeMeow-Box',
+    );
+
+    // Check if this is a reply to another message
+    const replyToMsg = msg.reply_to_message;
+    if (replyToMsg && content && content.trim()) {
+      const replyToMsgId = String(replyToMsg.message_id);
+      const originalMsg = getMessageById(replyToMsgId, chatJid);
+
+      if (originalMsg) {
+        logger.info(
+          { replyToMsgId, originalContent: originalMsg.content.slice(0, 50) },
+          'Detected reply to channel message, processing with context',
+        );
+
+        // Build contextual prompt
+        const escapeXml = (s: string) =>
+          s
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+
+        const prompt = `<messages>
+<message sender="${escapeXml(originalMsg.sender_name)}" time="${originalMsg.timestamp}">${escapeXml(originalMsg.content)}</message>
+<message sender="${escapeXml(senderName)}" time="${timestamp}">${escapeXml(content)}</message>
+</messages>`;
+
+        // Get registered group for SeMeow
+        const registeredGroups = config.getRegisteredGroups();
+        const seMeowJid = Object.entries(registeredGroups).find(
+          ([, g]) => g.folder === 'SeMeow',
+        )?.[0];
+
+        if (!seMeowJid) {
+          logger.warn('SeMeow group not registered');
+          return;
+        }
+
+        const group = registeredGroups[seMeowJid];
+        if (!group) {
+          logger.warn('SeMeow group not found');
+          return;
+        }
+
+        // Keep typing indicator alive
+        await ctx.replyWithChatAction('typing');
+        const typingInterval = setInterval(async () => {
+          try {
+            await bot!.api.sendChatAction(msg.chat.id, 'typing');
+          } catch {
+            /* best effort */
+          }
+        }, 4000);
+
+        try {
+          const response = await config.runAgent(
+            group,
+            prompt,
+            chatJid,
+          );
+
+          if (response) {
+            // Send response as reply to user's message
+            await bot!.api.sendMessage(msg.chat.id, response, {
+              reply_to_message_id: msg.message_id,
+            });
+
+            // Store bot response
+            storeTelegramMessage(
+              `bot-${Date.now()}`,
+              chatJid,
+              'bot',
+              ASSISTANT_NAME,
+              response,
+              new Date().toISOString(),
+              true,
+            );
+
+            logger.info({ responseLength: response.length }, 'Channel reply sent');
+          }
+        } catch (err) {
+          logger.error({ err }, 'Failed to process channel reply');
+        } finally {
+          clearInterval(typingInterval);
+        }
+      }
     }
   });
 
@@ -542,12 +659,7 @@ export async function connectTelegram(
           new Date().toISOString(),
           true,
         );
-        const showKeyboard = ASSISTANT_NAME === '瑟喵助手';
-        await sendTelegramMessage(msg.chat.id, promptDisplay, {
-          showNsfwKeyboard: showKeyboard,
-        });
-
-        // @Se-Meow-Box：生圖後自動轉發到頻道
+        // @Se-Meow-Box：生圖後自動轉發到頻道（必須在發給用戶之前，否則檔案會被刪除）
         if (SE_MEOW_BOX_CHANNEL_ID && bot) {
           try {
             const imageMatch2 = result.match(/\[IMAGE:([^\]]+)\]/);
@@ -572,6 +684,11 @@ export async function connectTelegram(
             logger.warn({ fwdErr }, 'Failed to forward to Se-Meow-Box');
           }
         }
+
+        const showKeyboard = ASSISTANT_NAME === '瑟喵助手';
+        await sendTelegramMessage(msg.chat.id, promptDisplay, {
+          showNsfwKeyboard: showKeyboard,
+        });
       } catch (err) {
         const errMsg = `生圖失敗: ${err instanceof Error ? err.message : String(err)}`;
         await sendTelegramMessage(msg.chat.id, errMsg);
@@ -603,15 +720,29 @@ export async function connectTelegram(
       'Processing Telegram message',
     );
 
-    // Keep "typing..." indicator alive every 4s (TG auto-clears after 5s)
-    await ctx.replyWithChatAction('typing');
-    const typingInterval = setInterval(async () => {
+    // Emoji cycling for "processing" indicator
+    const processingEmojis = ['⏳', '🌱', '⚙️', '🔄', '✨'];
+    let emojiIndex = 0;
+    let emojiMessageId: number | null = null;
+
+    // Send initial emoji message
+    try {
+      const emojiMsg = await bot!.api.sendMessage(msg.chat.id, `${processingEmojis[0]} 處理中...`);
+      emojiMessageId = emojiMsg.message_id;
+    } catch { /* ignore */ }
+
+    // Cycle emojis every 3 seconds
+    const emojiInterval = setInterval(async () => {
+      if (!emojiMessageId) return;
+      emojiIndex = (emojiIndex + 1) % processingEmojis.length;
       try {
-        await bot!.api.sendChatAction(msg.chat.id, 'typing');
-      } catch {
-        // Ignore — best effort
-      }
-    }, 4000);
+        await bot!.api.editMessageText(
+          msg.chat.id,
+          emojiMessageId,
+          `${processingEmojis[emojiIndex]} 處理中...`,
+        );
+      } catch { /* ignore */ }
+    }, 3000);
 
     // Create streaming controller for this chat
     const stream = createTelegramStream(msg.chat.id);
@@ -626,7 +757,14 @@ export async function connectTelegram(
       chatJid,
       streamCallbacks,
     );
-    clearInterval(typingInterval);
+    clearInterval(emojiInterval);
+
+    // Clean up emoji message if it exists
+    if (emojiMessageId) {
+      try {
+        await bot!.api.deleteMessage(msg.chat.id, emojiMessageId);
+      } catch { /* ignore */ }
+    }
 
     if (response) {
       // Finalize stream (flush remaining buffer)
@@ -671,6 +809,7 @@ export async function connectTelegram(
       await bot!.start({
         onStart: () => logger.info('Telegram polling started'),
         drop_pending_updates: true,
+        allowed_updates: ['message', 'channel_post'],
       });
     } catch (err) {
       if (err instanceof GrammyError && err.error_code === 409) {

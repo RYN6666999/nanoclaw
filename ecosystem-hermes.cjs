@@ -1,7 +1,7 @@
 module.exports = {
   apps: [{
-    name: 'nanoclaw-SeMeow',
-    script: '/Users/ryan/nanoclaw/node_modules/.bin/tsx',
+    name: 'nanoclaw-hermes',
+    script: './node_modules/.bin/tsx',
     args: 'src/index.ts',
     cwd: '/Users/ryan/nanoclaw',
     instances: 1,
@@ -9,22 +9,23 @@ module.exports = {
     autorestart: true,
     watch: false,
     max_memory_restart: '500M',
-    // env 區塊在 fork mode 下完整傳入
     env: {
       NODE_ENV: 'production',
       PATH: '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin',
-      ENV_FILE: '/Users/ryan/nanoclaw/.env.SeMeow',
-      ASSISTANT_NAME: '瑟喵',
-      OBSIDIAN_MEMORY_DIR_NAME: 'AI-work/semiao_Memories',
-      MAIN_GROUP_FOLDER: 'SeMeow',
+      ASSISTANT_NAME: '赫爾密斯',
+      ENV_FILE: '.env.hermes',
+      OBSIDIAN_MEMORY_DIR_NAME: 'hermes_memories',
+      MAIN_GROUP_FOLDER: 'main',
     },
-    error_file: '/tmp/nanoclaw-SeMeow-error.log',
-    out_file: '/tmp/nanoclaw-SeMeow-out.log',
+    error_file: '/tmp/nanoclaw-hermes-error.log',
+    out_file: '/tmp/nanoclaw-hermes-out.log',
     log_date_format: 'YYYY-MM-DD HH:mm:ss',
     merge_logs: true,
+    // 重啟策略
     min_uptime: '10s',
     max_restarts: 10,
     restart_delay: 3000,
+    // 健康檢查
     listen_timeout: 10000,
     kill_timeout: 5000
   }]

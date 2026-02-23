@@ -143,6 +143,22 @@ export function getMessagesSince(
     .all(chatJid, sinceTimestamp) as NewMessage[];
 }
 
+/**
+ * Get a single message by its ID.
+ */
+export function getMessageById(
+  msgId: string,
+  chatJid: string,
+): NewMessage | undefined {
+  return db
+    .prepare(
+      `SELECT id, chat_jid, sender, sender_name, content, timestamp
+       FROM messages
+       WHERE id = ? AND chat_jid = ?`,
+    )
+    .get(msgId, chatJid) as NewMessage | undefined;
+}
+
 // --- Scheduled Tasks ---
 
 export function createTask(

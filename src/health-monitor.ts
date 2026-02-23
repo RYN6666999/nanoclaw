@@ -87,7 +87,7 @@ async function handleRecovery(bot: Bot) {
   }, 'Bot connection lost — waiting before recovery attempt')
 
   // 記錄到 Obsidian（不阻塞）
-  logCrashToObsidian(health.restartCount).catch(() => {})
+  logCrashToObsidian(health.restartCount).catch(() => { })
 
   // 等待 backoff 後重置 fail count，讓 health check 再試
   await new Promise(resolve => setTimeout(resolve, backoff))
@@ -108,7 +108,7 @@ async function logCrashToObsidian(restartCount: number): Promise<void> {
     const crashLog = `[${new Date().toISOString()}] Bot reconnection attempt #${restartCount}`
     const changelogPath = path.join(
       os.homedir(),
-      'Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/AI-work/Nano_Memories/CHANGELOG.md'
+      'Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/AI-work/hermes_memories/TIMELINE.md'
     )
     const content = fs.readFileSync(changelogPath, 'utf-8')
     const lines = content.split('\n')

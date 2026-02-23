@@ -69,14 +69,14 @@ export const OBSIDIAN_VAULT_PATH =
     'AI-work',
   );
 export const OBSIDIAN_MEMORY_DIR_NAME =
-  process.env.OBSIDIAN_MEMORY_DIR_NAME || 'Nano_Memories';
+  process.env.OBSIDIAN_MEMORY_DIR_NAME || 'hermes_memories';
 export const OBSIDIAN_MEMORY_DIR = path.join(
   OBSIDIAN_VAULT_PATH,
   OBSIDIAN_MEMORY_DIR_NAME,
 );
 export const OBSIDIAN_CURRENT_CONTEXT = path.join(
   OBSIDIAN_MEMORY_DIR,
-  'Current_Context.md',
+  'CURRENT.md',
 );
 
 // --- External router config from Obsidian ---
@@ -87,7 +87,7 @@ export interface RouterConfig {
     openrouter: { enabled: boolean; url: string; model: string };
     gemini: { enabled: boolean; model: string; auto_threshold: number };
     claude: { enabled: boolean; model: string };
-    [key: string]: { enabled: boolean; [k: string]: unknown };
+    [key: string]: { enabled: boolean;[k: string]: unknown };
   };
   complex_keywords: string[];
   search_keywords: string[];
@@ -155,7 +155,7 @@ export const GEMINI_API_KEY = process.env.GOOGLE_API_KEY || '';
 export const GEMINI_MODEL =
   ROUTER_CONFIG?.backends?.gemini?.model ||
   process.env.GEMINI_MODEL ||
-  'gemini-2.0-flash';
+  'gemini-2.5-flash-lite';
 export const GEMINI_AUTO_THRESHOLD =
   ROUTER_CONFIG?.backends?.gemini?.auto_threshold ||
   parseInt(process.env.GEMINI_AUTO_THRESHOLD || '50000', 10);

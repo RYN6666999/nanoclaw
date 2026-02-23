@@ -104,7 +104,7 @@ export function readWakeFile(): string {
 }
 
 /**
- * Append a one-line activity record to Current_Context.md.
+ * Append a one-line activity record to CURRENT.md.
  * Called automatically after each agent response — no LLM needed.
  * Format: @LAST: YYYY-MM-DD HH:MM | [group] | [summary]
  */
@@ -308,8 +308,8 @@ export function appendConversationLog(
       fs.writeFileSync(filePath, `# 對話日誌 ${dateStr}\n`, 'utf-8');
     }
     fs.appendFileSync(filePath, entry, 'utf-8');
-  } catch {
-    // non-critical
+  } catch (err) {
+    logger.warn({ error: String(err) }, 'Non-critical: Failed to append conversation log');
   }
 }
 

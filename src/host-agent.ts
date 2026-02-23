@@ -78,7 +78,8 @@ async function rateLimitedFetch(
         }
 
         resolve(response);
-      } catch (err) {
+      } catch (err: any) {
+        logger.error({ url, error: String(err), stack: err.stack }, 'Fetch failed');
         reject(err);
       }
     };
@@ -145,7 +146,7 @@ function getSystemPrompt(groupFolder: string, backend?: string): string {
 群組: ${groupFolder}
 記憶路徑: ${memoryDir}/
 啟動文件: ${memoryDir}/WAKE.md  ← 已自動載入，無需再讀
-工作狀態: ${memoryDir}/Current_Context.md  ← 已自動載入，無需再讀
+工作狀態: ${memoryDir}/CURRENT.md  ← 已自動載入，無需再讀
 對話日誌: ${memoryDir}/Conversations/  ← qmd 已索引，用 qmd_search 查詢
 可用工具(${getToolDefinitions().length}個): ${toolNames}
 
@@ -183,7 +184,7 @@ function getSystemPrompt(groupFolder: string, backend?: string): string {
 
 **我是誰**：我已知道。見頂部 [系統身份] 區塊，不需要問用戶確認。
 **我的工具**：已列於 [系統身份]，不需要向用戶詢問「我能用什麼工具」。
-**我的記憶**：WAKE.md + Current_Context.md 已載入於本 prompt，無需再讀取。
+**我的記憶**：WAKE.md + CURRENT.md 已載入於本 prompt，無需再讀取。
 
 **遇到不確定的資訊**：
 1. 先呼叫 qmd_search 查詢本地記憶庫
@@ -191,7 +192,7 @@ function getSystemPrompt(groupFolder: string, backend?: string): string {
 3. 絕不推測、捏造、或說「我不確定我有沒有這個工具」
 
 **完成任何實質工作後**：
-- 呼叫 obsidian_note 更新 Current_Context.md（將完成項目移至已完成，加入新待辦）
+- 呼叫 obsidian_note 更新 CURRENT.md（將完成項目移至已完成，加入新待辦）
 
 **用戶提到「上次」「之前」「記得嗎」「那個方法」**：
 - 立即 qmd_search collection=obsidian，用對話關鍵字搜尋
@@ -263,8 +264,8 @@ async function* parseSSEStream(response: Response): AsyncGenerator<{
               toolCallAccum[idx].function.arguments += tc.function.arguments;
           }
         }
-      } catch {
-        /* skip malformed */
+      } catch (err: any) {
+        logger.error({ payload: data, error: err.message }, 'Failed to parse SSE JSON chunk from OpenRouter');
       }
     }
   }
@@ -288,17 +289,17 @@ async function runOpenRouter(
   // Build user message — Vision or plain text
   const userMessage = input?.imageBase64
     ? {
-        role: 'user' as const,
-        content: [
-          {
-            type: 'image_url',
-            image_url: {
-              url: `data:${input.imageMimeType || 'image/jpeg'};base64,${input.imageBase64}`,
-            },
+      role: 'user' as const,
+      content: [
+        {
+          type: 'image_url',
+          image_url: {
+            url: `data:${input.imageMimeType || 'image/jpeg'};base64,${input.imageBase64}`,
           },
-          { type: 'text', text: userText || '描述這張圖片' },
-        ],
-      }
+        },
+        { type: 'text', text: userText || '描述這張圖片' },
+      ],
+    }
     : { role: 'user' as const, content: userText };
 
   history.push(userMessage);
@@ -343,16 +344,17 @@ async function runOpenRouter(
             tools: tools.length > 0 ? tools : undefined,
             tool_choice: tools.length > 0 ? 'auto' : undefined,
             ...(model.includes('grok-3-mini')
-              ? { reasoning: { effort: 'none' } }
+              ? { reasoning: { effort: 'auto' } }
               : {}),
           }),
         },
       );
 
-      if (!response.ok)
-        throw new Error(
-          `OpenRouter Error: ${response.status} ${await response.text()}`,
-        );
+      if (!response.ok) {
+        const errorText = await response.text();
+        logger.error({ status: response.status, text: errorText }, 'OpenRouter API Error');
+        throw new Error(`OpenRouter Error: ${response.status} ${errorText}`);
+      }
 
       if (canStream) {
         let streamedContent = '';
@@ -547,8 +549,19 @@ export async function runHostAgent(
     input,
   );
 
+  let isDegraded = false;
+  let fallbackModelName = '';
+
   if (output.status === 'error') {
-    let firstError = output.error;
+    logger.error(
+      {
+        originalBackend: route.backend,
+        originalModel: route.model,
+        error: output.error,
+      },
+      'Primary model dispatch failed, initiating fallback chain.',
+    );
+
     for (const fb of getFallbackChain(usedBackend)) {
       usedBackend = fb.backend;
       usedModel = fb.model;
@@ -559,15 +572,33 @@ export async function runHostAgent(
         input.groupFolder,
         input,
       );
-      if (output.status === 'success') break;
-      // Record repeatable system errors (not user input problems)
-      const isApiError = /^(OpenRouter|Gemini|API|Error:|Unknown)/.test(output.error || '');
+      if (output.status === 'success') {
+        isDegraded = true;
+        fallbackModelName = usedModel;
+        break;
+      }
+      const isApiError = /^(OpenRouter|Gemini|API|Error:|Unknown)/.test(
+        output.error || '',
+      );
       if (isApiError && output.error) {
+        logger.warn(
+          {
+            fallbackBackend: usedBackend,
+            fallbackModel: usedModel,
+            error: output.error,
+          },
+          'Fallback attempt failed.',
+        );
         appendLessonLearned(
-          `fallback ${usedBackend} failed: ${(output.error || '').slice(0, 80)}`
+          `fallback ${usedBackend} failed: ${(output.error || '').slice(0, 80)}`,
         );
       }
     }
+  }
+
+  if (isDegraded && output.status === 'success') {
+    const notification = `\n\n⚠️ [系統提示：主要模型呼叫失敗，已自動切換至 ${fallbackModelName}]`;
+    output.result = (output.result || '') + notification;
   }
 
   // Post-response hooks (non-blocking)

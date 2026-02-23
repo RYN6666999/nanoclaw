@@ -1,7 +1,11 @@
 /**
- * Model Router for NanoClaw
- * Routes: grok-3-mini (default) -> lumimaid-70b (deep RP) -> gemini (long docs) -> grok-2 (/x search)
- * SeMeow架構：3-Mini日常+prompt優化 / Lumimaid深度RP / Gemini Vision
+ * Model Router for NanoClaw v2.0
+ * 赫爾密斯四層智力梯隊：
+ *   Tier 1 (默認): gemini-2.5-flash-lite (58分) — 日常對話
+ *   Tier 2 (/flash): gemini-2.5-flash (72分) — 一般 Coding
+ *   Tier 3 (/pro): gemini-3.1-pro-preview (97分) — 複雜推理
+ *   Tier 4 (/codex): openai/gpt-5.3-codex (94分) — 極致 Coding
+ * 瑟喵架構：Grok-3-Mini 日常 / Euryale 深度RP / Gemini Vision
  */
 import {
   DEFAULT_LOCAL_MODEL,
@@ -35,9 +39,12 @@ export interface RouteResult {
   prefix?: string;
 }
 
-// 赫密士模型常數
-const GLM_FLASH = 'z-ai/glm-4.7-flash';       // 預設：$0.06/1M，202K ctx
-// 瑟喵模型常數
+// === v2.0 赫爾密斯四層模型 ===
+const GEMINI_FLASH_LITE = 'gemini-2.5-flash-lite';  // Tier 1 預設：日常對話
+const GEMINI_FLASH_T2 = 'gemini-2.5-flash';         // Tier 2：一般 Coding
+// Tier 3: gemini-3.1-pro-preview (直接在 PREFIX_MAP)
+// Tier 4: openai/gpt-5.3-codex (直接在 PREFIX_MAP)
+// === 瑟喵模型常數 ===
 const GROK_MINI = 'x-ai/grok-3-mini';          // 瑟喵日常：$0.30/1M，131K ctx
 const EURYALE = 'sao10k/l3.3-euryale-70b';     // 深度RP：$0.65/1M，131K ctx
 const GROK_2 = 'x-ai/grok-2-1212';
@@ -50,6 +57,9 @@ const PREFIX_MAP: Record<string, { backend: Backend; model: string }> = {
   '/code': { backend: 'opencode', model: 'opencode' },
   '/rp': { backend: 'openrouter', model: EURYALE }, // 強制深度RP
   '/mini': { backend: 'openrouter', model: GROK_MINI }, // 強制Grok Mini
+  '/flash': { backend: 'gemini', model: GEMINI_FLASH_T2 }, // Tier 2
+  '/pro': { backend: 'gemini', model: 'gemini-3.1-pro-preview' },
+  '/codex': { backend: 'openrouter', model: 'openai/gpt-5.3-codex' },
 };
 
 const COMPLEX_KEYWORDS = ROUTER_CONFIG?.complex_keywords || [
@@ -175,12 +185,12 @@ export function routeMessage(
     };
   }
 
-  // 赫密士預設 → GLM-4.7-Flash（$0.06，成本優先）
+  // v2.0 赫爾密斯預設 → gemini-2.5-flash-lite（Tier 1，日常模式）
   // 瑟喵預設 → Grok 3-Mini（模擬人設，日常對話）
   const isHermes = (process.env.ASSISTANT_NAME || '').includes('赫');
   return {
-    backend: 'openrouter',
-    model: isHermes ? GLM_FLASH : GROK_MINI,
+    backend: isHermes ? 'gemini' : 'openrouter',
+    model: isHermes ? GEMINI_FLASH_LITE : GROK_MINI,
     prompt: rawPrompt,
     reason: 'default',
   };

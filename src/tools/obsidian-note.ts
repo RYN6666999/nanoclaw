@@ -13,11 +13,10 @@ async function handler(args: Record<string, unknown>): Promise<string> {
   const notePath = String(args.path || '');
   if (!notePath) return 'Error: path is required (relative to vault root)';
 
-  const resolved = path.join(OBSIDIAN_VAULT_PATH, notePath);
-
-  // Safety: prevent path traversal outside vault
-  if (!resolved.startsWith(OBSIDIAN_VAULT_PATH)) {
-    return 'Error: path must be within the Obsidian vault';
+  // Ensure path doesn't traverse upwards and is strictly inside OBSIDIAN_VAULT_PATH
+  const resolved = path.resolve(OBSIDIAN_VAULT_PATH, notePath);
+  if (!resolved.startsWith(path.resolve(OBSIDIAN_VAULT_PATH))) {
+    return 'Error: path must be strictly within the Obsidian vault';
   }
 
   try {
@@ -69,7 +68,7 @@ export const obsidianNote: Tool = {
           },
           path: {
             type: 'string',
-            description: 'Note path relative to vault root, e.g. "Nano_Memories/daily.md"',
+            description: 'Note path relative to vault root, e.g. "hermes_memories/daily.md"',
           },
           content: {
             type: 'string',
