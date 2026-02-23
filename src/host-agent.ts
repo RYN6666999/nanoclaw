@@ -29,10 +29,6 @@ import {
   writeObsidianContext,
   readWakeFile,
   autoAppendActivityLog,
-  updateWakeNow,
-  appendConversationLog,
-  appendLessonLearned,
-  distillMemoryIfNeeded,
 } from './obsidian-integration.js';
 import { RegisteredGroup } from './types.js';
 import { LoadBalancer } from './backend-metrics.js';
@@ -589,9 +585,6 @@ export async function runHostAgent(
           },
           'Fallback attempt failed.',
         );
-        appendLessonLearned(
-          `fallback ${usedBackend} failed: ${(output.error || '').slice(0, 80)}`,
-        );
       }
     }
   }
@@ -604,28 +597,9 @@ export async function runHostAgent(
   // Post-response hooks (non-blocking)
   if (output.status === 'success' && !input.isScheduledTask) {
     const history = conversationHistory[`openrouter_${input.groupFolder}`] || [];
-    const toolsUsed = history
-      .filter((m: any) => m.role === 'tool')
-      .map((m: any) => String(m.tool_call_id || '').split('_')[0])
-      .filter(Boolean);
 
-    // 1. Append @LAST line to Current_Context.md (instant, code-only)
-    setImmediate(() =>
-      autoAppendActivityLog(input.groupFolder, input.prompt, toolsUsed),
-    );
 
-    // 2. Persist conversation to Obsidian daily log (qmd-searchable forever)
-    setImmediate(() =>
-      appendConversationLog(
-        input.groupFolder,
-        usedModel,
-        input.prompt,
-        output.result ?? '',
-      ),
-    );
-
-    // 3. Rewrite WAKE.md NOW section via GLM-flash (async, ~1-2s)
-    void updateWakeNow(input.prompt, output.result ?? '');
+ 
   }
 
   logger.info(
@@ -671,7 +645,5 @@ export async function ensureBackendsAvailable(): Promise<void> {
   }
   initializeObsidianMemory();
 
-  // Start daily memory distillation check (runs immediately + every 24h)
-  void distillMemoryIfNeeded();
-  setInterval(() => void distillMemoryIfNeeded(), 24 * 60 * 60 * 1000);
+ 
 }
