@@ -7,8 +7,9 @@ import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
 
-import { OBSIDIAN_MEMORY_DIR, ASSISTANT_NAME, MAIN_GROUP_FOLDER } from './config.js';
+import { OBSIDIAN_MEMORY_DIR, ASSISTANT_NAME, MAIN_GROUP_FOLDER, PM2_CMD_PREFIX, PM2_LOG_DIR } from './config.js';
 import { logger } from './logger.js';
+import { sendAlert } from './alert-service.js';
 
 const HEARTBEAT_FILE = path.join(OBSIDIAN_MEMORY_DIR, 'HEARTBEAT.md');
 const HEARTBEAT_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
@@ -17,7 +18,6 @@ const MEMORY_THRESHOLD_MB = 400;
 let lastConvTime: string | null = null;
 let totalConversations = 0;
 let lastPm2Status: Record<string, { status: string; restart_time: number; memory: number }> = {};
-let sendAlertCallback: ((text: string) => Promise<void>) | null = null;
 
 /** Call this after each successful conversation to keep heartbeat stats fresh */
 export function heartbeatRecordConversation(groupFolder: string): void {
@@ -27,7 +27,6 @@ export function heartbeatRecordConversation(groupFolder: string): void {
 
 /** Detect anomalies in PM2 processes and send alerts */
 function detectAnomalies(pm2Procs: any[]): void {
-  if (!sendAlertCallback) return;
 
   for (const proc of pm2Procs) {
     const procName = proc.name;
@@ -39,14 +38,9 @@ function detectAnomalies(pm2Procs: any[]): void {
 
     // Check 1: Status not online
     if (currentStatus !== 'online') {
-      sendAlertCallback(
-        `⚠️ [Heartbeat] ${procName} 異常\n狀態: ${currentStatus}\n請檢查日誌: tail -f /tmp/${procName}-error.log`,
-      ).catch((err) => {
-        logger.warn(
-          { procName, err },
-          'Failed to send status alert',
-        );
-      });
+      sendAlert(
+        `⚠️ [Heartbeat] ${procName} 異常\n狀態: ${currentStatus}\n請檢查日誌: tail -f ${PM2_LOG_DIR}/${procName}-error.log`,
+      );
     }
 
     // Check 2: New restarts detected
@@ -55,26 +49,16 @@ function detectAnomalies(pm2Procs: any[]): void {
       currentRestarts > lastState.restart_time
     ) {
       const newRestarts = currentRestarts - lastState.restart_time;
-      sendAlertCallback(
-        `⚠️ [Heartbeat] ${procName} 發生崩潰\n重啟次數: ${lastState.restart_time} → ${currentRestarts} (新增 ${newRestarts} 次)\n請檢查日誌: tail -f /tmp/${procName}-error.log`,
-      ).catch((err) => {
-        logger.warn(
-          { procName, err },
-          'Failed to send restart alert',
-        );
-      });
+      sendAlert(
+        `⚠️ [Heartbeat] ${procName} 發生崩潰\n重啟次數: ${lastState.restart_time} → ${currentRestarts} (新增 ${newRestarts} 次)\n請檢查日誌: tail -f ${PM2_LOG_DIR}/${procName}-error.log`,
+      );
     }
 
     // Check 3: Memory > threshold
     if (currentMemoryMb > MEMORY_THRESHOLD_MB) {
-      sendAlertCallback(
+      sendAlert(
         `⚠️ [Heartbeat] ${procName} 記憶體過高\n當前: ${currentMemoryMb.toFixed(0)}MB (閾值: ${MEMORY_THRESHOLD_MB}MB)\n請考慮重啟或檢查記憶體洩漏`,
-      ).catch((err) => {
-        logger.warn(
-          { procName, err },
-          'Failed to send memory alert',
-        );
-      });
+      );
     }
 
     // Update last known state
@@ -98,7 +82,7 @@ function writeHeartbeat(): void {
     let botProcs: any[] = [];
     try {
       const pm2Out = execSync(
-        'export PATH="/opt/homebrew/bin:$PATH" && pm2 jlist',
+        `${PM2_CMD_PREFIX}pm2 jlist`,
         { timeout: 3000 },
       ).toString();
       const procs: any[] = JSON.parse(pm2Out);
@@ -192,15 +176,9 @@ _下次更新: ${new Date(Date.now() + HEARTBEAT_INTERVAL_MS).toISOString().slic
 let heartbeatStarted = false;
 
 /** Start the heartbeat loop. Call once from main(). */
-export function startHeartbeat(
-  sendAlert?: (text: string) => Promise<void>,
-): void {
+export function startHeartbeat(): void {
   if (heartbeatStarted) return;
   heartbeatStarted = true;
-
-  if (sendAlert) {
-    sendAlertCallback = sendAlert;
-  }
 
   // Write immediately on startup
   writeHeartbeat();
@@ -215,7 +193,6 @@ let lastGoalCheckDate: string | null = null;
  * Called once per day at 09:00 (or on first heartbeat if after 09:00).
  */
 function checkGoals(): void {
-  if (!sendAlertCallback) return;
 
   try {
     const now = new Date();
@@ -252,11 +229,9 @@ function checkGoals(): void {
       const goalList = upcomingGoals
         .map((l) => `  • ${l.slice(6).trim()}`)
         .join('\n');
-      sendAlertCallback(
+      sendAlert(
         `📋 [Heartbeat] 即將到期的目標\n\n${goalList}\n\n請在 WAKE.md 更新進度`,
-      ).catch((err) => {
-        logger.warn({ err }, 'Failed to send goal alert');
-      });
+      );
     }
   } catch (err) {
     logger.warn({ error: err instanceof Error ? err.message : String(err) },

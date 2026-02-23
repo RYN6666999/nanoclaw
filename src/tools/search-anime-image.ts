@@ -6,7 +6,7 @@ import path from "path";
 import type { Tool } from "./index.js";
 
 const DANBOORU_API = "https://danbooru.donmai.us";
-const OUTPUT_DIR = "/tmp/nanoclaw-images";
+const OUTPUT_DIR = process.env.NANOCLAW_IMAGE_DIR || "/tmp/nanoclaw-images";
 
 interface DanbooruPost {
   id: number;

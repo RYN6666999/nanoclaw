@@ -11,7 +11,7 @@ import type { Tool } from './index.js';
 // Qwen-Image: 中文支援優秀, Z-Image-Turbo: 雙語支援, Hyper-SD: 強大
 const HF_API_URL = 'https://router.huggingface.co/hf-inference/models/Qwen/Qwen-Image';
 const DRAW_THINGS_URL = 'http://127.0.0.1:7860';
-const OUTPUT_DIR = '/tmp/nanoclaw-images';
+const OUTPUT_DIR = process.env.NANOCLAW_IMAGE_DIR || '/tmp/nanoclaw-images';
 const TIMEOUT = 120000; // 2 minutes
 
 async function handler(args: Record<string, unknown>): Promise<string> {

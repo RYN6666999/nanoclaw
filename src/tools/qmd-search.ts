@@ -26,7 +26,7 @@ async function handler(args: Record<string, unknown>): Promise<string> {
   return new Promise((resolve) => {
     exec(
       command,
-      { timeout: TIMEOUT, env: { ...process.env, PATH: `/Users/ryan/.bun/bin:${process.env.PATH}` } },
+      { timeout: TIMEOUT, env: { ...process.env, PATH: `${process.env.QMD_EXTRA_PATH || ''}:${process.env.PATH}` } },
       (err, stdout, stderr) => {
         if (err && !stdout) {
           resolve(`qmd search error: ${stderr || err.message}`);

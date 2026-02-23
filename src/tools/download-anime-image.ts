@@ -5,7 +5,7 @@ import fs from "fs";
 import path from "path";
 import type { Tool } from "./index.js";
 
-const OUTPUT_DIR = "/tmp/nanoclaw-images";
+const OUTPUT_DIR = process.env.NANOCLAW_IMAGE_DIR || "/tmp/nanoclaw-images";
 
 async function handler(args: Record<string, unknown>): Promise<string> {
   const imageUrl = String(args.url || "");

@@ -21,7 +21,7 @@ export const SCHEDULER_POLL_INTERVAL = 60000;
 
 // Absolute paths needed for container mounts
 const PROJECT_ROOT = process.cwd();
-const HOME_DIR = process.env.HOME || '/Users/user';
+const HOME_DIR = process.env.HOME || '';
 
 // Mount security: allowlist stored OUTSIDE project root, never mounted into containers
 export const MOUNT_ALLOWLIST_PATH = path.join(
@@ -160,10 +160,17 @@ export const GEMINI_AUTO_THRESHOLD =
   ROUTER_CONFIG?.backends?.gemini?.auto_threshold ||
   parseInt(process.env.GEMINI_AUTO_THRESHOLD || '50000', 10);
 
+// Auto commit safety toggle (default: disabled)
+export const AUTO_COMMIT_ENABLED = process.env.AUTO_COMMIT_ENABLED === 'true';
+
 // SeMeow @Se-Meow-Box 頻道 ID（格式：-100xxxxxxxxxx）
 export const SE_MEOW_BOX_CHANNEL_ID = process.env.SE_MEOW_BOX_CHANNEL_ID
   ? parseInt(process.env.SE_MEOW_BOX_CHANNEL_ID, 10)
   : null;
+
+// PM2 command prefix (e.g., Homebrew path on macOS)
+export const PM2_CMD_PREFIX = process.env.PM2_CMD_PREFIX || 'export PATH="/opt/homebrew/bin:$PATH" && ';
+export const PM2_LOG_DIR = process.env.PM2_LOG_DIR || '/tmp';
 
 // PaddleOCR 配置 (可選增強)
 export const PADDLEOCR_ENABLED = process.env.PADDLEOCR_ENABLED === 'true';

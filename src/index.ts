@@ -15,11 +15,13 @@ import { initDatabase } from './db.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { startHeartbeat, heartbeatRecordConversation } from './heartbeat.js';
 import { startDecisionAgent } from './decision-agent.js';
+import { registerAlertSender } from './alert-service.js';
 import { RegisteredGroup, Session } from './types.js';
 import { loadJson, saveJson } from './utils.js';
 import { logger } from './logger.js';
 import {
   connectTelegram,
+  getTelegramBot,
   getTelegramChatId,
   isTelegramJid,
   sendTelegramMessage,
@@ -451,7 +453,9 @@ async function main(): Promise<void> {
 
   await ensureBackendsAvailable();
   initDatabase();
-  startHeartbeat(async (text) => {
+
+  // Register shared alert sender for heartbeat + decision-agent
+  registerAlertSender(async (text) => {
     const mainEntry = Object.entries(registeredGroups).find(
       ([, g]) => g.folder === MAIN_GROUP_FOLDER
     );
@@ -460,15 +464,10 @@ async function main(): Promise<void> {
     }
   });
 
+  startHeartbeat();
+
   // Start decision agent (15-min loop for autonomous goal tracking)
-  startDecisionAgent(async (text) => {
-    const mainEntry = Object.entries(registeredGroups).find(
-      ([, g]) => g.folder === MAIN_GROUP_FOLDER
-    );
-    if (mainEntry) {
-      await sendMessage(mainEntry[0], text);
-    }
-  });
+  startDecisionAgent();
   logger.info(
     {
       envFile: process.env.ENV_FILE || '.env',
@@ -510,9 +509,9 @@ async function main(): Promise<void> {
   startIpcWatcher();
 
   // Start health monitor after bot is connected
-  const bot = (global as any).__nanoclaw_bot;
-  if (bot) {
-    startHealthMonitor(bot);
+  const tgBot = getTelegramBot();
+  if (tgBot) {
+    startHealthMonitor(tgBot);
   }
 
   // Periodic metrics logging (every hour)

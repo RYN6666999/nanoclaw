@@ -6,6 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import { OBSIDIAN_MEMORY_DIR, OPENROUTER_API_KEY, OPENROUTER_API_BASE_URL } from './config.js';
 import { logger } from './logger.js';
+import { sendAlert } from './alert-service.js';
 
 const DECISION_FILE = path.join(OBSIDIAN_MEMORY_DIR, 'DECISIONS.md');
 const DECISION_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
@@ -22,9 +23,6 @@ const COOLDOWNS: Record<string, number> = {
 
 // Track last action time for cooldown management
 const lastActionTime: Record<string, number> = {};
-
-// Store reference to sendAlert callback
-let sendAlertCallback: ((text: string) => Promise<void>) | null = null;
 
 /**
  * Parse HEARTBEAT.md to extract system status summary
@@ -235,8 +233,8 @@ async function executeAction(type: string, reason: string): Promise<boolean> {
 
     const message = messages[type] || `[Decision Agent] ${type}: ${reason}`;
 
-    if (sendAlertCallback) {
-      await sendAlertCallback(message);
+    const sent = await sendAlert(message);
+    if (sent) {
       lastActionTime[type] = Date.now();
       recordDecision(`ACT:${type}`, 'sent');
       return true;
@@ -270,13 +268,9 @@ let decisionAgentStarted = false;
 /**
  * Start the decision agent loop
  */
-export function startDecisionAgent(sendAlert?: (text: string) => Promise<void>): void {
+export function startDecisionAgent(): void {
   if (decisionAgentStarted) return;
   decisionAgentStarted = true;
-
-  if (sendAlert) {
-    sendAlertCallback = sendAlert;
-  }
 
   // Run decision loop immediately on startup
   decisionLoop();

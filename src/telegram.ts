@@ -11,6 +11,8 @@ import {
   MAIN_GROUP_FOLDER,
   OPENROUTER_API_KEY,
   SE_MEOW_BOX_CHANNEL_ID,
+  AUTO_COMMIT_ENABLED,
+  PM2_CMD_PREFIX,
 } from './config.js';
 import { getMessageById, getMessagesSince, storeTelegramMessage } from './db.js';
 import { logger } from './logger.js';
@@ -132,7 +134,23 @@ export async function connectTelegram(
   token: string,
   config: TelegramConfig,
 ): Promise<void> {
+  // Persistent handoff keyboard
+  const handoffKeyboard = {
+    keyboard: [[{ text: '📝 產生 handoff' }]],
+    resize_keyboard: true,
+    one_time_keyboard: false,
+    is_persistent: true,
+  };
+
   bot = new Bot(token);
+
+  // 註冊 Telegram slash menu 指令
+  await bot.api.setMyCommands([
+    { command: 'handoff', description: '手動產生 session handoff 建議' },
+    { command: 'status', description: '顯示系統狀態' },
+    { command: 'restart', description: '重啟 bot 進程' },
+    { command: 'menu', description: '顯示快捷選單' }
+  ]);
 
   // Global error boundary — catches all unhandled errors
   bot.catch((err) => {
@@ -160,6 +178,57 @@ export async function connectTelegram(
     logger.info({ channelPost: ctx.channelPost }, 'Received channel_post event');
     const msg = ctx.channelPost;
     if (msg.chat.id !== SE_MEOW_BOX_CHANNEL_ID) {
+      return;
+    }
+
+    // /handoff command — manually trigger session handoff summary
+    if (msg.text === '/handoff' || msg.text.startsWith('/handoff ')) {
+      await ctx.replyWithChatAction('typing');
+      try {
+        const registeredGroups = config.getRegisteredGroups();
+        const group = registeredGroups[chatJid];
+        if (!group) {
+          await ctx.reply('此聊天尚未註冊為群組，無法產生 handoff。');
+          return;
+        }
+
+        const hostAgent = await import('./host-agent.js');
+        const summary = await hostAgent.triggerHandoffForGroup(group.folder);
+
+        const lines: string[] = [];
+        lines.push(`**Handoff 建議 - ${group.name}**`);
+        lines.push(`優先度：${summary.priority}`);
+        if (summary.summary) {
+          lines.push(`\n**承先啟後脈絡提示詞：**\n${summary.summary}`);
+        }
+        if (summary.obsidianLog) {
+          lines.push(`\n**已同步至 Obsidian：**\n${summary.obsidianLog}`);
+        }
+        if (summary.changedFilesList && summary.changedFilesList.length) {
+          lines.push('\n**變更檔案：**');
+          lines.push(summary.changedFilesList.slice(0, 20).join('\n'));
+        }
+        if (summary.commitSuggestion && summary.commitSuggestion.shouldCommit) {
+          lines.push(`\n**建議 commit:** ${summary.commitSuggestion.message}`);
+        } else {
+          lines.push('\n無自動 commit 建議');
+        }
+
+        // Send summary with inline buttons: Dry-run and Apply
+        const keyboard = {
+          inline_keyboard: [
+            [
+              { text: 'Dry-run', callback_data: `handoff:dry:${chatJid}` },
+              { text: 'Apply', callback_data: `handoff:apply:${chatJid}` },
+            ],
+          ],
+        };
+
+        await ctx.reply(lines.join('\n'), { reply_markup: keyboard });
+      } catch (err) {
+        logger.error({ err }, 'Manual handoff failed');
+        await ctx.reply('產生 handoff 失敗，請查看日誌。');
+      }
       return;
     }
 
@@ -388,6 +457,49 @@ export async function connectTelegram(
     const botId = ctx.me.id;
     if (msg.from.id === botId) return;
 
+    // 永遠顯示 handoff persistent keyboard
+    try {
+      // await ctx.reply(' ', { reply_markup: handoffKeyboard });
+    } catch {}
+    // handoff 按鈕觸發 handoff summary
+    if (msg.text === '📝 產生 handoff') {
+      await ctx.replyWithChatAction('typing');
+      try {
+        const chatJid = makeTelegramJid(msg.chat.id);
+        const registeredGroups = config.getRegisteredGroups();
+        const group = registeredGroups[chatJid];
+        if (!group) {
+          await ctx.reply('此聊天尚未註冊為群組，無法產生 handoff。', { reply_markup: handoffKeyboard });
+          return;
+        }
+        const hostAgent = await import('./host-agent.js');
+        const summary = await hostAgent.triggerHandoffForGroup(group.folder);
+        const lines: string[] = [];
+        lines.push(`**Handoff 建議 - ${group.name}**`);
+        lines.push(`優先度：${summary.priority}`);
+        if (summary.summary) {
+          lines.push(`\n**承先啟後脈絡提示詞：**\n${summary.summary}`);
+        }
+        if (summary.obsidianLog) {
+          lines.push(`\n**已同步至 Obsidian：**\n${summary.obsidianLog}`);
+        }
+        if (summary.changedFilesList && summary.changedFilesList.length) {
+          lines.push('\n**變更檔案：**');
+          lines.push(summary.changedFilesList.slice(0, 20).join('\n'));
+        }
+        if (summary.commitSuggestion && summary.commitSuggestion.shouldCommit) {
+          lines.push(`\n**建議 commit:** ${summary.commitSuggestion.message}`);
+        } else {
+          lines.push('\n無自動 commit 建議');
+        }
+        await ctx.reply(lines.join('\n'), { reply_markup: handoffKeyboard });
+      } catch (err) {
+        logger.error({ err }, 'Persistent handoff failed');
+        await ctx.reply('產生 handoff 失敗，請查看日誌。', { reply_markup: handoffKeyboard });
+      }
+      return;
+    }
+
     const chatJid = makeTelegramJid(msg.chat.id);
     const timestamp = new Date(msg.date * 1000).toISOString();
     const senderName =
@@ -461,7 +573,7 @@ export async function connectTelegram(
       try {
         const { exec } = await import('node:child_process');
         exec(
-          'export PATH="/opt/homebrew/bin:$PATH" && pm2 jlist',
+          `${PM2_CMD_PREFIX}pm2 jlist`,
           (err, stdout) => {
             if (err) {
               ctx.reply('❌ 無法讀取系統狀態');
@@ -522,7 +634,7 @@ export async function connectTelegram(
       try {
         const { exec } = await import('node:child_process');
         exec(
-          'export PATH="/opt/homebrew/bin:$PATH" && pm2 restart nanoclaw',
+          `${PM2_CMD_PREFIX}pm2 restart nanoclaw`,
           (err, stdout) => {
             if (err) {
               logger.error({ err }, 'Failed to restart via PM2');
@@ -745,7 +857,8 @@ export async function connectTelegram(
     }, 3000);
 
     // Create streaming controller for this chat
-    const stream = createTelegramStream(msg.chat.id);
+    const showKeyboard = ASSISTANT_NAME === '瑟喵助手';
+    const stream = createTelegramStream(msg.chat.id, { showNsfwKeyboard: showKeyboard });
     const streamCallbacks = {
       onStreamChunk: (chunk: string) => stream.push(chunk),
       onStreamDone: () => stream.finalize(),
@@ -800,8 +913,63 @@ export async function connectTelegram(
     'Connected to Telegram (grammY)',
   );
 
-  // Return bot instance for health monitoring
-  (global as any).__nanoclaw_bot = bot;
+  // Handle callback queries for handoff buttons
+  bot.on('callback_query:data', async (ctx) => {
+    try {
+      const data = ctx.callbackQuery.data || '';
+      if (!data.startsWith('handoff:')) return ctx.answerCallbackQuery({ text: 'Unknown action', show_alert: false });
+      const parts = data.split(':');
+      const action = parts[1];
+      const chatJid = parts.slice(2).join(':');
+      await ctx.answerCallbackQuery({ text: '處理中...', show_alert: false });
+
+      const registeredGroups = config.getRegisteredGroups();
+      const group = registeredGroups[chatJid];
+      if (!group) {
+        await ctx.reply('找不到對應群組，請先註冊該聊天');
+        return;
+      }
+
+      const hostAgent = await import('./host-agent.js');
+      const summary = await hostAgent.triggerHandoffForGroup(group.folder);
+
+      if (action === 'dry') {
+        const lines: string[] = [];
+        lines.push(`**Handoff (dry-run) - ${group.name}**`);
+        lines.push(`優先度：${summary.priority}`);
+        if (summary.changedFilesList && summary.changedFilesList.length) {
+          lines.push('變更檔案：');
+          lines.push(summary.changedFilesList.slice(0, 50).join('\n'));
+        }
+        if (summary.commitSuggestion && summary.commitSuggestion.shouldCommit) {
+          lines.push(`建議 commit: ${summary.commitSuggestion.message}`);
+        } else {
+          lines.push('無自動 commit 建議');
+        }
+        await ctx.reply(lines.join('\n'));
+        return;
+      }
+
+      if (action === 'apply') {
+        if (!AUTO_COMMIT_ENABLED) {
+          await ctx.reply('AUTO_COMMIT_ENABLED 未啟用，無法執行自動 commit。請在 .env 設定後重試。');
+          return;
+        }
+        // Use auto-commit module directly to avoid shelling out
+        const autoCommit = await import('./auto-commit.js');
+        const handoffs = autoCommit.loadHandoffs();
+        const actions = autoCommit.applyHandoffs(handoffs, { apply: true, autoCommitEnabled: true });
+        const outLines = actions.map(a => `group:${a.group} committed:${a.committed} msg:${a.message}`);
+        await ctx.reply('自動 commit 已執行：\n' + outLines.join('\n'));
+        return;
+      }
+    } catch (e) {
+      logger.error({ err: e }, 'Callback handler error');
+      try { await ctx.answerCallbackQuery({ text: '處理失敗', show_alert: true }); } catch {}
+    }
+  });
+
+  // Bot instance accessible via getTelegramBot()
 
   // Start long polling with aggressive 409 conflict resolution
   const startPolling = async (attempt = 1): Promise<void> => {
@@ -974,11 +1142,18 @@ export async function sendTelegramMessage(
           [{ text: '💬 聊天基礎' }, { text: '🔥 聊天進階' }],
           [{ text: '🎨 指定生圖' }, { text: '📱 頻道管理' }],
           [{ text: '🛠️ 安裝技能' }, { text: '🧠 更新記憶' }],
+          [{ text: '📝 產生 handoff' }],
         ],
         resize_keyboard: true,
         one_time_keyboard: false,
+        is_persistent: true,
       }
-    : undefined;
+    : {
+        keyboard: [[{ text: '📝 產生 handoff' }]],
+        resize_keyboard: true,
+        one_time_keyboard: false,
+        is_persistent: true,
+      };
 
   const html = markdownToTelegramHtml(text);
   try {
@@ -1017,7 +1192,10 @@ export async function sendTelegramMessage(
  * Stream a message to Telegram — send initial message then update it.
  * Returns a controller for pushing chunks and finalizing.
  */
-export function createTelegramStream(chatId: number) {
+export function createTelegramStream(
+  chatId: number,
+  options?: { showNsfwKeyboard?: boolean },
+) {
   if (!bot) throw new Error('Telegram bot not initialized');
 
   let messageId: number | null = null;
@@ -1027,19 +1205,41 @@ export function createTelegramStream(chatId: number) {
   const MIN_EDIT_INTERVAL = 1500; // Telegram rate limit ~1/sec, use 1.5s for safety
   const botRef = bot;
 
+  const replyMarkup = options?.showNsfwKeyboard
+    ? {
+        keyboard: [
+          [{ text: '💬 聊天基礎' }, { text: '🔥 聊天進階' }],
+          [{ text: '🎨 指定生圖' }, { text: '📱 頻道管理' }],
+          [{ text: '🛠️ 安裝技能' }, { text: '🧠 更新記憶' }],
+          [{ text: '📝 產生 handoff' }],
+        ],
+        resize_keyboard: true,
+        one_time_keyboard: false,
+        is_persistent: true,
+      }
+    : {
+        keyboard: [[{ text: '📝 產生 handoff' }]],
+        resize_keyboard: true,
+        one_time_keyboard: false,
+        is_persistent: true,
+      };
+
   async function flush() {
     if (!messageId || !buffer) return;
     const html = markdownToTelegramHtml(buffer);
     try {
       await botRef.api.editMessageText(chatId, messageId, html, {
         parse_mode: 'HTML',
+        reply_markup: replyMarkup,
       });
       lastEditTime = Date.now();
     } catch (err) {
       // If HTML fails, try plain text
       if (err instanceof GrammyError && err.error_code === 400) {
         try {
-          await botRef.api.editMessageText(chatId, messageId, buffer);
+          await botRef.api.editMessageText(chatId, messageId, buffer, {
+            reply_markup: replyMarkup,
+          });
           lastEditTime = Date.now();
         } catch {
           // Ignore edit failures during streaming
@@ -1059,11 +1259,14 @@ export function createTelegramStream(chatId: number) {
           const html = markdownToTelegramHtml(buffer);
           const msg = await botRef.api.sendMessage(chatId, html, {
             parse_mode: 'HTML',
+            reply_markup: replyMarkup,
           });
           messageId = msg.message_id;
           lastEditTime = Date.now();
         } catch {
-          const msg = await botRef.api.sendMessage(chatId, buffer);
+          const msg = await botRef.api.sendMessage(chatId, buffer, {
+            reply_markup: replyMarkup,
+          });
           messageId = msg.message_id;
           lastEditTime = Date.now();
         }
