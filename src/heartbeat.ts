@@ -8,6 +8,7 @@ import path from 'path';
 import { execSync } from 'child_process';
 
 import { OBSIDIAN_MEMORY_DIR, ASSISTANT_NAME, MAIN_GROUP_FOLDER, PM2_CMD_PREFIX, PM2_LOG_DIR } from './config.js';
+import type { PM2Process } from './types.js';
 import { logger } from './logger.js';
 import { sendAlert } from './alert-service.js';
 
@@ -26,7 +27,7 @@ export function heartbeatRecordConversation(groupFolder: string): void {
 }
 
 /** Detect anomalies in PM2 processes and send alerts */
-function detectAnomalies(pm2Procs: any[]): void {
+function detectAnomalies(pm2Procs: PM2Process[]): void {
 
   for (const proc of pm2Procs) {
     const procName = proc.name;
@@ -79,13 +80,13 @@ function writeHeartbeat(): void {
 
     // PM2 process info (best effort)
     let pm2Status = '(PM2 不可用)';
-    let botProcs: any[] = [];
+    let botProcs: PM2Process[] = [];
     try {
       const pm2Out = execSync(
         `${PM2_CMD_PREFIX}pm2 jlist`,
         { timeout: 3000 },
       ).toString();
-      const procs: any[] = JSON.parse(pm2Out);
+      const procs: PM2Process[] = JSON.parse(pm2Out);
       botProcs = procs.filter((p) =>
         p.name.startsWith('nanoclaw'),
       );

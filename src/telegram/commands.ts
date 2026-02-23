@@ -6,6 +6,7 @@ import fs from 'fs';
 import type { Bot, Context } from 'grammy';
 import { InputFile } from 'grammy';
 
+import type { PM2Process } from '../types.js';
 import {
   ASSISTANT_NAME,
   SE_MEOW_BOX_CHANNEL_ID,
@@ -47,25 +48,9 @@ export async function handleHandoffButton(
   }
   const hostAgent = await import('../host-agent.js');
   const summary = await hostAgent.triggerHandoffForGroup(group.folder);
-  const lines: string[] = [];
-  lines.push(`**Handoff 建議 - ${group.name}**`);
-  lines.push(`優先度：${summary.priority}`);
-  if (summary.summary) {
-    lines.push(`\n**承先啟後脈絡提示詞：**\n${summary.summary}`);
-  }
-  if (summary.obsidianLog) {
-    lines.push(`\n**已同步至 Obsidian：**\n${summary.obsidianLog}`);
-  }
-  if (summary.changedFilesList && summary.changedFilesList.length) {
-    lines.push('\n**變更檔案：**');
-    lines.push(summary.changedFilesList.slice(0, 20).join('\n'));
-  }
-  if (summary.commitSuggestion && summary.commitSuggestion.shouldCommit) {
-    lines.push(`\n**建議 commit:** ${summary.commitSuggestion.message}`);
-  } else {
-    lines.push('\n無自動 commit 建議');
-  }
-  await ctx.reply(lines.join('\n'), { reply_markup: handoffKeyboard });
+  const { formatHandoffLines } = await import('../handoff-service.js');
+  const text = formatHandoffLines(group.name, summary).join('\n');
+  await ctx.reply(text, { reply_markup: handoffKeyboard });
   return true;
 }
 
@@ -108,7 +93,7 @@ export async function handleStatus(ctx: Context): Promise<boolean> {
       }
       try {
         const pm2Data = JSON.parse(stdout);
-        const nanoclaw = pm2Data.find((p: any) => p.name === 'nanoclaw');
+        const nanoclaw = pm2Data.find((p: PM2Process) => p.name === 'nanoclaw');
         if (!nanoclaw) {
           ctx.reply('❌ Bot 進程不存在（已崩潰）\n\n使用 /restart 重啟');
           return;

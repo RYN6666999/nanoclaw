@@ -41,12 +41,23 @@ nanoclaw/
 │   └── REQUIREMENTS.md       # 設計理念
 ├── src/
 │   ├── index.ts              # 主程式：Telegram 連線、狀態管理
-│   ├── telegram.ts           # Telegram 通道 + /draw 指令
 │   ├── host-agent.ts         # LLM 呼叫 + Vision + 工具路由
 │   ├── model-router.ts       # 前綴/關鍵字 → 模型決策
 │   ├── config.ts             # 配置載入 + API 檢查
 │   ├── db.ts                 # SQLite 訊息存儲
+│   ├── handoff-service.ts    # Handoff 格式化（統一所有 UI 呈現）
 │   ├── task-scheduler.ts     # 排程任務（暫未用）
+│   ├── types.ts              # 共用型別（ToolCall, PM2Process, HandoffEntry 等）
+│   ├── telegram/             # Telegram 通道模組
+│   │   ├── index.ts          # connectTelegram、stopTelegram、re-exports
+│   │   ├── handlers.ts       # Orchestrator：註冊所有 handler
+│   │   ├── commands.ts       # /status, /restart, /menu, /draw, handoff, SeMeow 快捷
+│   │   ├── channel-handler.ts # channel_post handler（SeMeow-Box）
+│   │   ├── callback-handler.ts # callback_query（handoff 按鈕）
+│   │   ├── stream.ts         # SSE 串流 + sendTelegramMessage
+│   │   ├── utils.ts          # JID 工具、enrichPrompt、markdownToHtml
+│   │   ├── types.ts          # TelegramConfig interface
+│   │   └── state.ts          # Bot 單例 getter/setter
 │   └── tools/                # 工具實現
 │       ├── index.ts
 │       ├── generate-image.ts

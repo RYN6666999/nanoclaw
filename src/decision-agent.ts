@@ -7,6 +7,7 @@ import path from 'path';
 import { OBSIDIAN_MEMORY_DIR, OPENROUTER_API_KEY, OPENROUTER_API_BASE_URL } from './config.js';
 import { logger } from './logger.js';
 import { sendAlert } from './alert-service.js';
+import type { OpenRouterResponse } from './types.js';
 
 const DECISION_FILE = path.join(OBSIDIAN_MEMORY_DIR, 'DECISIONS.md');
 const DECISION_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
@@ -191,7 +192,7 @@ async function makeDecision(): Promise<{ action: string; type?: string; reason: 
       return { action: 'WAIT', reason: `API error: ${response.status}` };
     }
 
-    const data = (await response.json()) as any;
+    const data = (await response.json()) as OpenRouterResponse;
     const answer = data.choices?.[0]?.message?.content?.trim() || '';
 
     // Parse response

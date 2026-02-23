@@ -2,7 +2,9 @@ import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
 
-export type Handoff = { time: string; group: string; summary: any };
+import type { HandoffSummary } from './types.js';
+
+export type Handoff = { time: string; group: string; summary: HandoffSummary };
 
 export function loadHandoffs(filePath?: string): Handoff[] {
   const outPath = filePath || path.join(process.cwd(), 'logs', 'handoff_suggestions.json');

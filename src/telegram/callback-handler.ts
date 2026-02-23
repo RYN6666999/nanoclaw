@@ -5,6 +5,7 @@ import type { Bot } from 'grammy';
 
 import { AUTO_COMMIT_ENABLED } from '../config.js';
 import { logger } from '../logger.js';
+import type { HandoffAction } from '../types.js';
 import type { TelegramConfig } from './types.js';
 
 /**
@@ -31,19 +32,13 @@ export function registerCallbackHandler(bot: Bot, config: TelegramConfig): void 
       const summary = await hostAgent.triggerHandoffForGroup(group.folder);
 
       if (action === 'dry') {
-        const lines: string[] = [];
-        lines.push(`**Handoff (dry-run) - ${group.name}**`);
-        lines.push(`優先度：${summary.priority}`);
-        if (summary.changedFilesList && summary.changedFilesList.length) {
-          lines.push('變更檔案：');
-          lines.push(summary.changedFilesList.slice(0, 50).join('\n'));
-        }
-        if (summary.commitSuggestion && summary.commitSuggestion.shouldCommit) {
-          lines.push(`建議 commit: ${summary.commitSuggestion.message}`);
-        } else {
-          lines.push('無自動 commit 建議');
-        }
-        await ctx.reply(lines.join('\n'));
+        const { formatHandoffLines } = await import('../handoff-service.js');
+        const text = formatHandoffLines(group.name, summary, {
+          label: 'Handoff (dry-run)',
+          compact: true,
+          maxFiles: 50,
+        }).join('\n');
+        await ctx.reply(text);
         return;
       }
 
@@ -55,7 +50,7 @@ export function registerCallbackHandler(bot: Bot, config: TelegramConfig): void 
         const autoCommit = await import('../auto-commit.js');
         const handoffs = autoCommit.loadHandoffs();
         const actions = autoCommit.applyHandoffs(handoffs, { apply: true, autoCommitEnabled: true });
-        const outLines = actions.map((a: any) => `group:${a.group} committed:${a.committed} msg:${a.message}`);
+        const outLines = actions.map((a: HandoffAction) => `group:${a.group} committed:${a.committed} msg:${a.message}`);
         await ctx.reply('自動 commit 已執行：\n' + outLines.join('\n'));
         return;
       }

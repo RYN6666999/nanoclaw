@@ -39,25 +39,8 @@ export function registerChannelHandler(bot: Bot, _token: string, config: Telegra
 
         const hostAgent = await import('../host-agent.js');
         const summary = await hostAgent.triggerHandoffForGroup(group.folder);
-
-        const lines: string[] = [];
-        lines.push(`**Handoff 建議 - ${group.name}**`);
-        lines.push(`優先度：${summary.priority}`);
-        if (summary.summary) {
-          lines.push(`\n**承先啟後脈絡提示詞：**\n${summary.summary}`);
-        }
-        if (summary.obsidianLog) {
-          lines.push(`\n**已同步至 Obsidian：**\n${summary.obsidianLog}`);
-        }
-        if (summary.changedFilesList && summary.changedFilesList.length) {
-          lines.push('\n**變更檔案：**');
-          lines.push(summary.changedFilesList.slice(0, 20).join('\n'));
-        }
-        if (summary.commitSuggestion && summary.commitSuggestion.shouldCommit) {
-          lines.push(`\n**建議 commit:** ${summary.commitSuggestion.message}`);
-        } else {
-          lines.push('\n無自動 commit 建議');
-        }
+        const { formatHandoffLines } = await import('../handoff-service.js');
+        const text = formatHandoffLines(group.name, summary).join('\n');
 
         const keyboard = {
           inline_keyboard: [
@@ -68,7 +51,7 @@ export function registerChannelHandler(bot: Bot, _token: string, config: Telegra
           ],
         };
 
-        await ctx.reply(lines.join('\n'), { reply_markup: keyboard });
+        await ctx.reply(text, { reply_markup: keyboard });
       } catch (err) {
         logger.error({ err }, 'Manual handoff failed');
         await ctx.reply('產生 handoff 失敗，請查看日誌。');

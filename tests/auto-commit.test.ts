@@ -54,4 +54,35 @@ describe('auto-commit module', () => {
     expect(execMock).toHaveBeenCalledTimes(2);
     expect(actions[0].committed).toBe(true);
   });
+
+  test('loadHandoffs returns empty array for non-existent file', () => {
+    expect(loadHandoffs('/tmp/nonexistent-file.json')).toEqual([]);
+  });
+
+  test('loadHandoffs returns empty array for invalid JSON', () => {
+    const badPath = path.join(process.cwd(), 'logs', 'bad.json');
+    fs.writeFileSync(badPath, '{{{invalid');
+    expect(loadHandoffs(badPath)).toEqual([]);
+    fs.unlinkSync(badPath);
+  });
+
+  test('applyHandoffs skips entries without commitSuggestion', () => {
+    const handoffs = [
+      { time: 'now', group: 'g', summary: {} },
+      { time: 'now', group: 'g', summary: { commitSuggestion: { shouldCommit: false, message: '' } } },
+    ];
+    const actions = applyHandoffs(handoffs as any, { apply: true, autoCommitEnabled: true });
+    expect(actions.length).toBe(0);
+  });
+
+  test('applyHandoffs uses default message when commitSuggestion.message is empty', () => {
+    const handoffs = [
+      { time: '2026-01-01', group: 'main', summary: { commitSuggestion: { shouldCommit: true, message: '' } } },
+    ];
+    const execMock = child.execSync as jest.Mock;
+    execMock.mockClear();
+    execMock.mockImplementation(() => 'ok');
+    const actions = applyHandoffs(handoffs as any, { apply: true, autoCommitEnabled: true });
+    expect(actions[0].message).toContain('auto handoff');
+  });
 });

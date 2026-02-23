@@ -91,3 +91,59 @@ export interface HandoffSummary {
   nextSessionPrompt?: string;
   changedFilesList?: string[];
 }
+
+/** OpenRouter-compatible tool call in SSE response */
+export interface ToolCall {
+  id: string;
+  function: { name: string; arguments: string };
+}
+
+/** OpenRouter-compatible chat message */
+export interface OpenRouterMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string | null;
+  tool_calls?: ToolCall[];
+  tool_call_id?: string;
+}
+
+/** PM2 process descriptor from `pm2 jlist` */
+export interface PM2Process {
+  name: string;
+  pid: number;
+  pm2_env: { status: string; pm_uptime: number; restart_time: number };
+  monit: { memory: number; cpu: number };
+}
+
+/** Persisted handoff entry in handoff_suggestions.json */
+export interface HandoffEntry {
+  time: string;
+  group: string;
+  summary: HandoffSummary;
+}
+
+/** OpenRouter API response shape (chat completions) */
+export interface OpenRouterResponse {
+  choices?: Array<{
+    message?: { content?: string; tool_calls?: ToolCall[] };
+    delta?: { content?: string; tool_calls?: Array<{ index: number; id?: string; function?: { name?: string; arguments?: string } }> };
+  }>;
+}
+
+/** Brave Search API response shape */
+export interface BraveSearchResponse {
+  web?: Array<{ title?: string; url?: string; description?: string }>;
+}
+
+/** DuckDuckGo instant answer API response shape */
+export interface DDGSearchResponse {
+  RelatedTopics?: Array<{ Text?: string; FirstURL?: string }>;
+  AbstractText?: string;
+  AbstractURL?: string;
+}
+
+/** Auto-commit action result */
+export interface HandoffAction {
+  group: string;
+  message: string;
+  committed: boolean;
+}

@@ -46,12 +46,12 @@ export function startHealthMonitor(bot: Bot) {
       // API 連通 → 重置 fail count
       health.lastHeartbeat = Date.now()
       health.failCount = 0
-    } catch (err: any) {
+    } catch (err: unknown) {
       health.failCount++
       logger.warn({
         failCount: health.failCount,
         maxFail: MAX_FAIL,
-        error: err?.message?.slice(0, 100),
+        error: err instanceof Error ? err.message.slice(0, 100) : String(err),
       }, 'Health check: getMe failed')
 
       if (health.failCount >= MAX_FAIL) {

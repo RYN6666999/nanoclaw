@@ -5,6 +5,7 @@
  */
 import type { Tool } from './index.js';
 import { searchDeduplicator } from '../request-dedup.js';
+import type { BraveSearchResponse, OpenRouterResponse } from '../types.js';
 
 
 interface SearchResult {
@@ -72,7 +73,7 @@ async function searchBrave(query: string): Promise<SearchResult[]> {
 
     if (!res.ok) return [];
 
-    const data = (await res.json()) as any;
+    const data = (await res.json()) as BraveSearchResponse;
     const results: SearchResult[] = [];
     const resultsWeb = data.web || [];
     for (const r of resultsWeb.slice(0, 5)) {
@@ -136,7 +137,7 @@ Return as JSON array: [{"title":"...","url":"...","snippet":"..."},...]`,
 
     if (!res.ok) return [];
 
-    const data = (await res.json()) as any;
+    const data = (await res.json()) as OpenRouterResponse;
     const content = data.choices?.[0]?.message?.content || '';
 
     // Parse JSON from Grok response

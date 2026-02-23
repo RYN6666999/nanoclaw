@@ -31,7 +31,7 @@ import {
   readWakeFile,
   autoAppendActivityLog,
 } from './obsidian-integration.js';
-import { RegisteredGroup, HandoffSummary } from './types.js';
+import { RegisteredGroup, HandoffSummary, ToolCall, OpenRouterMessage, HandoffEntry } from './types.js';
 import { LoadBalancer } from './backend-metrics.js';
 
 /** Type for dynamically imported handoff skill module */
@@ -227,14 +227,14 @@ function extractPromptText(prompt: string): string {
 async function* parseSSEStream(response: Response): AsyncGenerator<{
   type: 'delta' | 'tool_calls' | 'done';
   content?: string;
-  tool_calls?: any[];
+  tool_calls?: ToolCall[];
 }> {
   const reader = response.body?.getReader();
   if (!reader) return;
 
   const decoder = new TextDecoder();
   let buffer = '';
-  const toolCallAccum: Record<number, any> = {};
+  const toolCallAccum: Record<number, ToolCall> = {};
 
   while (true) {
     const { done, value } = await reader.read();
@@ -278,8 +278,8 @@ async function* parseSSEStream(response: Response): AsyncGenerator<{
               toolCallAccum[idx].function.arguments += tc.function.arguments;
           }
         }
-      } catch (err: any) {
-        logger.error({ payload: data, error: err.message }, 'Failed to parse SSE JSON chunk from OpenRouter');
+      } catch (err: unknown) {
+        logger.error({ payload: data, error: err instanceof Error ? err.message : String(err) }, 'Failed to parse SSE JSON chunk from OpenRouter');
       }
     }
   }
@@ -330,12 +330,12 @@ async function runOpenRouter(
 3. 查本機檔案/執行命令→bash；查筆記記憶→qmd_search；分析圖片→用戶需直接傳照片
 4. 不反問用戶，不確定時先用 qmd_search 或 bash 自行查詢`;
 
-  const messages: any[] = [
+  const messages: OpenRouterMessage[] = [
     { role: 'system', content: systemPrompt },
     ...history.slice(0, -1),
     { role: 'system', content: behaviorAnchor },
     history[history.length - 1],
-  ].filter(Boolean);
+  ].filter(Boolean) as OpenRouterMessage[];
   const canStream = !!input?.onStreamChunk;
   const tools = getToolDefinitions();
 
@@ -411,7 +411,7 @@ async function runOpenRouter(
           break;
         }
         if (msg.tool_calls) {
-          messages.push(msg);
+          messages.push({ role: 'assistant', content: msg.content ?? null, tool_calls: msg.tool_calls });
           for (const tc of msg.tool_calls) {
             const handler = getToolHandler(tc.function.name);
             const toolResult = handler
@@ -667,21 +667,9 @@ export async function runHostAgent(
             const chatJid = Object.keys(groups).find(k => groups[k].folder === input.groupFolder);
             if (chatJid) {
               const chatId = parseInt(chatJid.split('@')[0], 10);
-              const lines: string[] = [];
-              lines.push(`**自動 Handoff 建議 - ${input.groupFolder}**`);
-              lines.push(`優先度：${summary.priority}`);
-              if (summary.summary) lines.push(`\n**承先啟後脈絡提示詞：**\n${summary.summary}`);
-              if (summary.obsidianLog) lines.push(`\n**已同步至 Obsidian：**\n${summary.obsidianLog}`);
-              if (summary.changedFilesList && summary.changedFilesList.length) {
-                lines.push('\n**變更檔案：**');
-                lines.push(summary.changedFilesList.slice(0, 20).join('\n'));
-              }
-              if (summary.commitSuggestion && summary.commitSuggestion.shouldCommit) {
-                lines.push(`\n**建議 commit:** ${summary.commitSuggestion.message}`);
-              } else {
-                lines.push('\n無自動 commit 建議');
-              }
-              await sendTelegramMessage(chatId, lines.join('\n'));
+              const { formatHandoffLines } = await import('./handoff-service.js');
+              const text = formatHandoffLines(input.groupFolder, summary, { label: '自動 Handoff 建議' }).join('\n');
+              await sendTelegramMessage(chatId, text);
             }
           } catch (e) {
             logger.warn({ error: String(e) }, 'Failed to send auto handoff to Telegram');
@@ -690,7 +678,7 @@ export async function runHostAgent(
           try {
             const outPath = path.join(process.cwd(), 'logs', 'handoff_suggestions.json');
             const obj = { time: new Date().toISOString(), group: input.groupFolder, summary };
-            let arr = [] as any[];
+            let arr: HandoffEntry[] = [];
             try {
               const raw = fs.readFileSync(outPath, 'utf-8');
               arr = JSON.parse(raw || '[]');
@@ -792,7 +780,7 @@ export async function triggerHandoffForGroup(groupFolder: string): Promise<Hando
     try {
       const outPath = path.join(process.cwd(), 'logs', 'handoff_suggestions.json');
       const obj = { time: new Date().toISOString(), group: groupFolder, summary };
-      let arr = [] as any[];
+      let arr: HandoffEntry[] = [];
       try {
         const raw = fs.readFileSync(outPath, 'utf-8');
         arr = JSON.parse(raw || '[]');
