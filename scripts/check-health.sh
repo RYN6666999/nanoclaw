@@ -16,8 +16,18 @@ NC='\033[0m'
 echo "🔍 NanoClaw 健康檢查 ($(date))"
 echo "---"
 
-# 1. 檢查兩個 bot 進程
-BOTS=("nanoclaw-SeMeow" "nanoclaw-asis")
+PROJECT_DIR="/Users/ryan/nanoclaw"
+
+# Bot 配置：PM2 name → ecosystem file, .env file
+declare -A BOT_ECOSYSTEM BOT_ENV
+BOT_ECOSYSTEM[nanoclaw-semeow]="ecosystem-semeow.cjs"
+BOT_ECOSYSTEM[nanoclaw-hermes]="ecosystem-hermes.cjs"
+BOT_ENV[nanoclaw-semeow]=".env.semeow"
+BOT_ENV[nanoclaw-hermes]=".env.hermes"
+
+BOTS=("nanoclaw-semeow" "nanoclaw-hermes")
+
+# 1. 檢查 bot 進程
 for BOT in "${BOTS[@]}"; do
   STATUS=$(pm2 jlist 2>/dev/null | python3 -c "
 import sys, json
@@ -40,12 +50,8 @@ for p in json.load(sys.stdin):
     echo "  PID: $PID"
   elif [[ "$STATUS" == "not_found" ]]; then
     echo -e "${RED}✗ ${BOT} 未註冊，正在啟動...${NC}"
-    cd /Users/ryan/nanoclaw
-    if [[ "$BOT" == "nanoclaw-SeMeow" ]]; then
-      pm2 start ecosystem-SeMeow.config.cjs
-    else
-      pm2 start ecosystem-asis.config.cjs
-    fi
+    cd "$PROJECT_DIR"
+    pm2 start "${BOT_ECOSYSTEM[$BOT]}"
   else
     echo -e "${RED}✗ ${BOT} 狀態: ${STATUS}，正在重啟...${NC}"
     pm2 restart "$BOT"
@@ -66,17 +72,18 @@ for BOT in "${BOTS[@]}"; do
   fi
 done
 
-# 3. 檢查 Telegram API 連線
+# 3. Telegram API 連線測試
 echo "🌐 測試 Telegram API..."
-for ENV_FILE in "/Users/ryan/nanoclaw/.env.SeMeow" "/Users/ryan/nanoclaw/.env.asis"; do
+for BOT in "${BOTS[@]}"; do
+  ENV_FILE="${PROJECT_DIR}/${BOT_ENV[$BOT]}"
   if [[ -f "$ENV_FILE" ]]; then
     BOT_NAME=$(grep ASSISTANT_NAME "$ENV_FILE" | cut -d= -f2 | tr -d '"' | tr -d "'" | xargs)
     TG_TOKEN=$(grep TELEGRAM_BOT_TOKEN "$ENV_FILE" | cut -d= -f2 | tr -d '"' | tr -d "'" | xargs)
     if [[ -n "$TG_TOKEN" ]]; then
       if curl -s --max-time 10 "https://api.telegram.org/bot${TG_TOKEN}/getMe" | grep -q '"ok":true'; then
-        echo -e "${GREEN}✓ ${BOT_NAME} Telegram API 可達${NC}"
+        echo -e "${GREEN}✓ ${BOT_NAME:-$BOT} Telegram API 可達${NC}"
       else
-        echo -e "${RED}✗ ${BOT_NAME} Telegram API 無回應${NC}"
+        echo -e "${RED}✗ ${BOT_NAME:-$BOT} Telegram API 無回應${NC}"
       fi
     fi
   fi

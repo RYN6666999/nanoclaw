@@ -4,8 +4,14 @@ import os
 import hashlib
 from datetime import datetime
 
-OBSIDIAN_SCHEDULE_PATH = "/Users/ryan/Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/Nano_Memories/SCHEDULE.md"
-DB_PATH = "/Users/ryan/nanoclaw/store/messages.db"
+OBSIDIAN_SCHEDULE_PATH = os.environ.get(
+    "OBSIDIAN_SCHEDULE_PATH",
+    os.path.join(os.path.dirname(__file__), "..", "Obsidian", "Nano_Memories", "SCHEDULE.md")
+)
+DB_PATH = os.environ.get(
+    "NANOCLAW_DB_PATH",
+    os.path.join(os.path.dirname(__file__), "..", "store", "messages.db")
+)
 DEFAULT_CHAT_JID = "8227006739"  # Love_papa
 DEFAULT_GROUP = "main"
 
