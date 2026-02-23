@@ -195,7 +195,7 @@ LLM 收到結果：
 
 ### Phase 3: 保存到 Obsidian（自動）
 
-**檔案位置：** `~/nanoclaw/Obsidian/Nano_Memories/Conversations/HANDOFF-YYYYMMDD-HHMM.md`
+**檔案位置：** `/Users/ryan/Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/AI-work/_GUIDE/HANDOFF-YYYYMMDD-HHMM.md`
 
 **場景 A（視窗切換）檔案格式：**
 ```markdown
@@ -269,7 +269,7 @@ LLM 收到結果：
 ─────────────────────────────
 
 📄 詳細交接記錄已保存：
-   ~/nanoclaw/Obsidian/Nano_Memories/Conversations/HANDOFF-20260223-1430.md
+   /Users/ryan/Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/AI-work/_GUIDE/HANDOFF-20260223-1430.md
 ```
 
 **場景 B 返回：**
@@ -283,7 +283,7 @@ LLM 收到結果：
 [Agent 的結果摘要]
 
 【Obsidian 記錄】
-~/nanoclaw/Obsidian/Nano_Memories/Conversations/HANDOFF-20260223-1430.md
+/Users/ryan/Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/AI-work/_GUIDE/HANDOFF-20260223-1430.md
 
 【等待 LLM 決策下一步...】
 ```
@@ -307,7 +307,7 @@ LLM 收到結果：
 ─────────────────────────────
 
 📄 詳細交接記錄已保存：
-   ~/nanoclaw/Obsidian/Nano_Memories/Conversations/HANDOFF-20260223-1430.md
+   /Users/ryan/Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/AI-work/_GUIDE/HANDOFF-20260223-1430.md
 ```
 
 ### Phase 5: 自動判斷 Git 提交（自動）
@@ -379,7 +379,7 @@ Hash: ab1c2d3e4f5g6h7i
 預計：~3 小時後
 
 【交接記錄】
-~/nanoclaw/Obsidian/Nano_Memories/Conversations/HANDOFF-20260223-1430.md
+/Users/ryan/Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/AI-work/_GUIDE/HANDOFF-20260223-1430.md
 ```
 
 ---
@@ -443,10 +443,10 @@ AI ✨ → 繼續工作（無縫銜接）
 ### 檢查交接記錄
 ```bash
 # 查看最近的交接記錄
-ls -lt ~/nanoclaw/Obsidian/Nano_Memories/Conversations/HANDOFF-*.md | head -5
+ls -lt "/Users/ryan/Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/AI-work/_GUIDE/HANDOFF-"*.md | head -5
 
 # 查看特定交接
-cat ~/nanoclaw/Obsidian/Nano_Memories/Conversations/HANDOFF-20260223-1430.md
+cat "/Users/ryan/Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/AI-work/_GUIDE/HANDOFF-20260223-1430.md"
 ```
 
 ---
@@ -483,7 +483,7 @@ cat ~/nanoclaw/Obsidian/Nano_Memories/Conversations/HANDOFF-20260223-1430.md
 {
   "handoff_max_tokens": 500,           // 提示詞最大 token 數
   "token_threshold_percent": 20,       // token 閾值（%）
-  "obsidian_dir": "~/nanoclaw/Obsidian/Nano_Memories/Conversations",
+  "obsidian_dir": "/Users/ryan/Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/AI-work/_GUIDE",
   "include_code_snippets": false,      // 是否包含程式碼片段
   "auto_prompt_copy": true             // 自動複製提示詞到剪貼板
 }
@@ -511,7 +511,7 @@ cat ~/nanoclaw/Obsidian/Nano_Memories/Conversations/HANDOFF-20260223-1430.md
 
 | 問題 | 解決方案 |
 |------|--------|
-| Obsidian 檔案寫入失敗 | 檢查 `~/nanoclaw/Obsidian` 是否存在 + 可寫 |
+| Obsidian 檔案寫入失敗 | 檢查 `/Users/ryan/Library/Mobile Documents/iCloud~md~obsidian/Documents/Fun/AI-work/_GUIDE` 是否存在 + 可寫 |
 | 提示詞生成為空 | 檢查對話歷史是否正常（看 Recent Tasks） |
 | Token 檢測不準確 | 手動觸發：說「保存進度」 |
 

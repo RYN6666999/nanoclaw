@@ -13,8 +13,8 @@ echo "🔄 正在重啟 NanoClaw..."
 if ! pm2 list | grep -q "nanoclaw"; then
   echo "❌ PM2 無 nanoclaw 進程，嘗試啟動..."
   cd "$PROJECT_DIR"
-  pm2 start ecosystem-semeow.cjs
-  pm2 start ecosystem-hermes.cjs
+  pm2 start ecosystem.semeow.config.cjs
+  pm2 start ecosystem.hermes.config.cjs
   exit 0
 fi
 

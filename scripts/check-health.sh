@@ -20,8 +20,8 @@ PROJECT_DIR="/Users/ryan/nanoclaw"
 
 # Bot 配置：PM2 name → ecosystem file, .env file
 declare -A BOT_ECOSYSTEM BOT_ENV
-BOT_ECOSYSTEM[nanoclaw-semeow]="ecosystem-semeow.cjs"
-BOT_ECOSYSTEM[nanoclaw-hermes]="ecosystem-hermes.cjs"
+BOT_ECOSYSTEM[nanoclaw-semeow]="ecosystem.semeow.config.cjs"
+BOT_ECOSYSTEM[nanoclaw-hermes]="ecosystem.hermes.config.cjs"
 BOT_ENV[nanoclaw-semeow]=".env.semeow"
 BOT_ENV[nanoclaw-hermes]=".env.hermes"
 
