@@ -12,6 +12,8 @@ logs/
 # Secrets
 *.keys.json
 .env
+.env.*
+!.env.example
 
 # OS
 .DS_Store
