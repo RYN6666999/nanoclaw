@@ -51,7 +51,7 @@ async function generateHandoffSummary(
 ): Promise<HandoffResult> {
   const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
   if (!apiKey) {
-    throw new Error('GEMINI_API_KEY or GOOGLE_API_KEY environment variable not set.');
+    throw new Error('未設定 GEMINI_API_KEY 或 GOOGLE_API_KEY 環境變數。請在 .env 檔案中設定後重試。');
   }
 
   const model = 'gemini-2.5-flash';
@@ -90,7 +90,7 @@ async function generateHandoffSummary(
     "message": "如果變更值得提交，則產生一條符合慣例的 commit 訊息，否則為空字串。"
   },
   "obsidianLog": "一份詳細的 Obsidian Markdown 格式日誌。必須包含：總結、關鍵決策、使用者偏好、踩坑紀錄與解決方案、目標校準。內容必須為繁體中文。",
-  "nextSessionPrompt": "為下一個 AI 助理產生一段簡潔、富含上下文的提示詞。此項至關重要。格式為 Markdown，需包含：**先前脈絡**、**最終狀態**與**後續目標**（需具體、可量化）。內容必須為繁體中文。"
+  "nextSessionPrompt": "為下一個 AI 助理產生一段簡潔、富含上下文的提示詞。此項至關重要。格式為 Markdown，需包含：**先前脈絡**（簡述上一次對話中使用者的不滿或關鍵回饋）、**最終狀態**（列出已提交的 commit hash 與核心修正項目）與**後續目標**（必須包含至少 2 個可量化指標，例如：'錯誤率 ≤ 0%'、'覆蓋率 ≥ 95%'、'延遲 < 500ms'，禁止使用模糊描述如「持續改善」）。所有內容必須為繁體中文。"
 }
 
 ### 對話上下文
@@ -118,14 +118,14 @@ ${messages.map(m => `- "${m}"`).join('\n')}
 
   if (!response.ok) {
     const errorBody = await response.text();
-    throw new Error(`API request failed with status ${response.status}: ${errorBody}`);
+    throw new Error(`API 請求失敗，狀態碼 ${response.status}：${errorBody}`);
   }
 
   const data = await response.json();
   
   if (!data.candidates || !data.candidates[0].content.parts[0].text) {
-    console.error('Invalid API response structure:', JSON.stringify(data, null, 2));
-    throw new Error('Failed to parse LLM response.');
+    console.error('API 回應結構異常：', JSON.stringify(data, null, 2));
+    throw new Error('無法解析 LLM 回應。請檢查 API 金鑰與模型名稱是否正確。');
   }
 
   const resultText = data.candidates[0].content.parts[0].text;
@@ -137,7 +137,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   (async () => {
     try {
       if (process.argv.length < 3) {
-        throw new Error('JSON input string not provided as a command-line argument.');
+        throw new Error('未提供 JSON 輸入字串作為命令列參數。');
       }
       const input = JSON.parse(process.argv[2]);
       const result = await generateHandoffSummary(input.title, input.messages, input.meta || {});
@@ -154,7 +154,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       console.log(`\n✅ 精華日誌已同步至 Obsidian: ${path.relative(process.cwd(), obsidianFile)}`);
 
     } catch (error) {
-      console.error('Error executing script:', error);
+      console.error('腳本執行錯誤：', error);
       process.exit(1);
     }
   })();
